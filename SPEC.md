@@ -1,6 +1,6 @@
 # Build: Anti-fraud decision service (Go)
 
-You are building a take-home assignment end-to-end. Performance is the top priority after correctness. Work in phases, verify each phase before moving on, and do not stop until every acceptance criterion in section 12 passes. Use Context7 MCP for any library documentation (pgx v5, k6, testcontainers-go, Docker Compose). Ask me only if something is truly blocking; otherwise follow the assumptions in section 11 and record any new ones in NOTES.md.
+You are building a take-home assignment end-to-end. Performance is the top priority after correctness. Work in phases, verify each phase before moving on, and do not stop until every acceptance criterion in section 12 passes. Use Context7 MCP for any library documentation (pgx v5, k6, testcontainers-go, Docker Compose). Ask me only if something is truly blocking; otherwise follow the assumptions in section 11 and record any new ones in AI_NOTES.md.
 
 ## 1. Goal
 
@@ -285,7 +285,7 @@ Makefile targets:
 - make load
 - make bench
 
-## 11. Assumptions (record them in NOTES.md)
+## 11. Assumptions (record them in AI_NOTES.md)
 
 - Decisions use the server clock as "now".
 - A duplicate eventId with a different payload: the first one wins and the rest count as duplicates.
@@ -364,7 +364,7 @@ Benchmarks:
     internal/rules (pure engine)
     internal/money
     internal/store (pgx, schema migration on startup)
-    load/k6.js, scripts/, docker-compose.yml, Dockerfile (multi-stage, distroless), Makefile, README.md, NOTES.md
+    load/k6.js, scripts/, docker-compose.yml, Dockerfile (multi-stage, distroless), Makefile, README.md, AI_NOTES.md
 
 docker-compose.yml:
 
@@ -381,6 +381,6 @@ docker-compose.yml:
 3. Startup replay, snapshot, readiness, and the restart durability test.
 4. Generator, manifest and verify. Load 10M events and report load time, replay time and RSS.
 5. k6 load test. Profile with pprof and iterate until every threshold passes with margin. Usual culprits: allocations in JSON decode, lock contention, GC, flush size.
-6. README with run instructions for the service, tests, generator and load test, plus a measured-results table (throughput, p50/p95/p99, error rate, visibility p99, RSS, replay time) and machine specs (CPU model, cores, RAM, OS, Docker version). NOTES.md covering assumptions, trade-offs (single stateful instance; scale-out by partitioning player state by playerId and device state by deviceId behind a log), what you'd do with another day, and where AI tools helped.
+6. README with run instructions for the service, tests, generator and load test, plus a measured-results table (throughput, p50/p95/p99, error rate, visibility p99, RSS, replay time) and machine specs (CPU model, cores, RAM, OS, Docker version). AI_NOTES.md covering assumptions, trade-offs (single stateful instance; scale-out by partitioning player state by playerId and device state by deviceId behind a log), what you'd do with another day, and where AI tools helped.
 
 Done means: make test, make verify and make load all pass on a fresh clone after docker compose up and make seed.
