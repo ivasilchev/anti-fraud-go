@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# --- Build stage ---
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 RUN --mount=type=bind,source=go.mod,target=go.mod \
@@ -13,7 +12,6 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/bin/ ./cmd/server ./cmd/generate ./cmd/verify \
  && mkdir -p /out/data /out/manifest
 
-# --- Runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build --link /out/bin/ /usr/local/bin/
 # Mount points for the snapshot and manifest volumes, owned by nonroot so that

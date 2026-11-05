@@ -39,7 +39,6 @@ func newTable[T any]() *table[T] {
 	return t
 }
 
-// shardFor returns the shard of id and its shard number.
 func (t *table[T]) shardFor(id string) (*shard[T], uint32) {
 	s := shardOf(id)
 	return &t.shards[s], s
@@ -71,7 +70,6 @@ func (sh *shard[T]) find(id string) *T {
 // at returns the state at position pos. The caller must hold a lock on the shard.
 func (sh *shard[T]) at(pos uint32) *T { return &sh.item[pos] }
 
-// len returns the number of entities across all shards.
 func (t *table[T]) len() int {
 	n := 0
 	for i := range t.shards {

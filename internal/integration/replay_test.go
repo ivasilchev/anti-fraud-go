@@ -172,7 +172,6 @@ func TestSnapshotFromAnotherLogIsIgnored(t *testing.T) {
 	}
 	check("truncated log")
 
-	// A corrupt snapshot.
 	if err := os.WriteFile(path, []byte("AFGOSNAP garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
