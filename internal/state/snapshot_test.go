@@ -222,3 +222,18 @@ func hugeCount() []byte {
 	b = binary.AppendUvarint(b, 1<<40)
 	return binary.LittleEndian.AppendUint32(b, crcOf(b))
 }
+
+func TestTrimChangesNoState(t *testing.T) {
+	s := New()
+	applyAll(s, richEvents(), 1)
+	before := encode(t, s)
+	s.Trim()
+	if !bytes.Equal(encode(t, s), before) {
+		t.Fatal("Trim changed the state")
+	}
+	v := s.Acquire("p0", "d0", "")
+	defer v.Release()
+	if cap(v.P.Devices) != len(v.P.Devices) || cap(v.D.Players) != len(v.D.Players) {
+		t.Fatal("slices were not trimmed")
+	}
+}

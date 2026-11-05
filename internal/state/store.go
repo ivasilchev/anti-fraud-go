@@ -164,3 +164,45 @@ func (v *View) Release() {
 	v.ps.RUnlock()
 	v.P, v.D, v.ps, v.ds = nil, nil, nil, nil
 }
+
+// Trim shrinks every slice to its length, releasing the spare capacity that
+// append leaves behind (about 100 MB after replaying 10M events). It changes
+// no state, only capacity. It takes each shard's write lock in turn; call it
+// from the writer goroutine or before the writer starts.
+func (s *State) Trim() {
+	trimTable(s.players, func(p *Player) {
+		p.RecentBets = trimmed(p.RecentBets)
+		p.Declines = trimmed(p.Declines)
+		p.Devices = trimmed(p.Devices)
+		p.ApprovedPMs = trimmed(p.ApprovedPMs)
+	})
+	trimTable(s.devices, func(d *Device) {
+		d.Declines = trimmed(d.Declines)
+		d.Players = trimmed(d.Players)
+	})
+	trimTable(s.methods, func(*struct{}) {})
+}
+
+func trimTable[T any](t *table[T], trimItem func(*T)) {
+	for i := range t.shards {
+		sh := &t.shards[i]
+		sh.mu.Lock()
+		for j := range sh.item {
+			trimItem(&sh.item[j])
+		}
+		sh.item = trimmed(sh.item)
+		sh.rev = trimmed(sh.rev)
+		sh.mu.Unlock()
+	}
+}
+
+// trimmed returns s with cap == len, or nil when it is empty.
+func trimmed[E any](s []E) []E {
+	if len(s) == 0 {
+		return nil
+	}
+	if cap(s) == len(s) {
+		return s
+	}
+	return append(make([]E, 0, len(s)), s...)
+}

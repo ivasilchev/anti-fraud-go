@@ -3,7 +3,10 @@
 package metrics
 
 import (
+	"bytes"
 	"io"
+	"os"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -132,6 +135,16 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 	gauge("snapshot_bytes", "Size of the last snapshot written.", m.SnapshotBytes.Load())
 	seconds("snapshot_pause_seconds", "How long the last snapshot paused the writer.", m.SnapshotPauseMicros.Load())
 
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	gauge("go_memstats_heap_inuse_bytes", "Bytes in in-use heap spans.", int64(ms.HeapInuse))
+	gauge("go_memstats_heap_alloc_bytes", "Bytes of allocated heap objects.", int64(ms.HeapAlloc))
+	gauge("go_memstats_sys_bytes", "Bytes obtained from the OS by the Go runtime.", int64(ms.Sys))
+	counter("go_gc_cycles_total", "Completed GC cycles.", int64(ms.NumGC))
+	if rss, ok := residentBytes(); ok {
+		gauge("process_resident_memory_bytes", "Resident set size (Linux only).", rss)
+	}
+
 	var depth int64
 	if m.QueueDepth != nil {
 		depth = m.QueueDepth()
@@ -142,4 +155,21 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 
 	_, err := w.Write(b)
 	return err
+}
+
+// residentBytes reads the resident set size from /proc/self/statm.
+func residentBytes() (int64, bool) {
+	b, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0, false
+	}
+	f := bytes.Fields(b)
+	if len(f) < 2 {
+		return 0, false
+	}
+	pages, err := strconv.ParseInt(string(f[1]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return pages * int64(os.Getpagesize()), true
 }

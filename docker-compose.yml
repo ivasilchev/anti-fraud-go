@@ -1,0 +1,108 @@
+name: anti-fraud-go
+
+# Credentials come from PGUSER/PGPASSWORD (read by pgx), not the URL.
+x-db-env: &db-env
+  DATABASE_URL: postgres://db:5432/antifraud?sslmode=disable
+  PGUSER: ${POSTGRES_USER:-antifraud}
+  PGPASSWORD: ${POSTGRES_PASSWORD:-antifraud}
+
+services:
+  db:
+    image: postgres:17
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - synchronous_commit=on
+      - -c
+      - wal_compression=on
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-antifraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-antifraud}
+      POSTGRES_DB: antifraud
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U antifraud -d antifraud"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  app:
+    build: .
+    image: anti-fraud-go:latest
+    environment:
+      <<: *db-env
+      # Tuned from the SPEC's 1500MiB: ~500 MB live heap with GOGC=200 would
+      # otherwise grow to the limit and exceed the 1.2 GB RSS budget.
+      GOMEMLIMIT: ${GOMEMLIMIT:-1100MiB}
+      GOGC: ${GOGC:-200}
+      # Set to an empty string to disable snapshots (forces a full replay).
+      SNAPSHOT_PATH: ${SNAPSHOT_PATH-/data/snapshot.bin}
+      TEST_MODE: ${TEST_MODE:-false}
+      PPROF: ${PPROF:-0}
+    ports:
+      - "8080:8080"
+    volumes:
+      - snapshots:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/server", "healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 3
+      # Replaying 10M events takes a while; failures don't count meanwhile.
+      start_period: 10m
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  generate:
+    image: anti-fraud-go:latest
+    profiles: ["generate"]
+    entrypoint: ["/usr/local/bin/generate"]
+    command:
+      - --players=${PLAYERS:-1000000}
+      - --events=${EVENTS:-10000000}
+      - --days=${DAYS:-90}
+      - --seed=${SEED:-42}
+      - --manifest=/manifest/manifest.json
+    environment: *db-env
+    volumes:
+      - manifest:/manifest
+    depends_on:
+      db:
+        condition: service_healthy
+
+  verify:
+    image: anti-fraud-go:latest
+    profiles: ["generate"]
+    entrypoint: ["/usr/local/bin/verify"]
+    command: ["--manifest=/manifest/manifest.json", "--url=http://app:8080"]
+    volumes:
+      - manifest:/manifest
+
+volumes:
+  pgdata:
+  snapshots:
+  manifest:

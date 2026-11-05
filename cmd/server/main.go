@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +30,9 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck())
+	}
 	if err := run(); err != nil {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
@@ -147,6 +152,9 @@ func run() error {
 		return fmt.Errorf("recovery: %w", rec.err)
 	}
 	st, stats := rec.st, rec.stats
+	// Drop append slack and return replay garbage to the OS before serving.
+	st.Trim()
+	debug.FreeOSMemory()
 	players, devices, methods := st.Counts()
 	seq, _ := st.Watermark()
 	slog.Info("recovered", "snapshotSeq", stats.SnapshotSeq, "replayed", stats.Replayed, "watermark", seq,
@@ -223,4 +231,28 @@ func takeSnapshot(w *ingest.Writer, m *metrics.Metrics, path string) {
 		m.SnapshotPauseMicros.Store(info.Pause.Microseconds())
 		slog.Info("snapshot written", "seq", info.Seq, "bytes", info.Bytes, "pause", info.Pause, "elapsed", info.Elapsed)
 	}
+}
+
+// healthcheck is the container healthcheck (distroless has no curl): it
+// exits 0 when /health/ready on the local port returns 200.
+func healthcheck() int {
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/health/ready")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "not ready:", resp.Status)
+		return 1
+	}
+	return 0
 }

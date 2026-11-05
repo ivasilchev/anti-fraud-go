@@ -1,0 +1,6 @@
+.git
+.agents
+.claude
+*.md
+manifest.json
+out/

@@ -232,3 +232,127 @@ Tests:
   acknowledged event is in Postgres and in memory.
 - `ON CONFLICT DO NOTHING` uses up a sequence value even for a skipped
   duplicate, so seqs have gaps. Counts must use `count(*)`, never seq arithmetic.
+
+## Additional assumptions (phase 4)
+
+Generator (`cmd/generate`, logic in `internal/gen`):
+
+- `--events` is the exact total, planted events included. Every player gets a
+  registration session (3–5 events), and the remaining events go to sessions
+  of Zipf-chosen players (s = 1.1, v = 20, ranks mapped through a fixed
+  permutation so that the busy players are spread across the ID space).
+  Session lengths are planned up front so the total is exact.
+  `--events` must leave at least 3 background events per player.
+- Sessions follow LOGIN → DEPOSIT_ATTEMPT → APPROVED (88%) / DECLINED (and,
+  half the time, a retry) → BET (60%) / WIN, with an occasional BET_VOIDED (3%)
+  of the player's last bet. 15% of sessions end with WITHDRAWAL_REQUESTED. 2% of
+  sessions add a PASSWORD_RESET, and 2% add a PAYOUT_METHOD_ADDED. Events in a
+  session are 5–90 s apart. Every event in a session carries its device, and
+  LOGIN also carries an IP.
+- Every per-player attribute is a pure function of the player index and the
+  seed, so nothing per player is stored:
+  - Currency: 60% EUR, 25% USD, 15% GBP.
+  - Payment methods: 1–3, `pm<3i+k>`.
+  - Devices: a primary device `d<i>`, and for 30% of players a second one `d<n+i>`.
+- Shared devices: `d<2n+g>`, with groups of 3, 4, 5, 6 players in turn. They
+  are sized to be 2% of the devices in use.
+  - A shared player's registration session falls within the last 29 days. Its
+    events after the LOGIN use the shared device, so every shared device has
+    3–6 players within the last 30 days.
+  - The test checks both the 2% share and the 3–6 range.
+- Background sessions start between `now − days` and `now − 45 min` and last
+  under 36 min, so no background event is in the future.
+- The events are produced in occurredAt order by a min-heap merge, with
+  sessions sorted by start. Planted events are merged into the same stream.
+  One COPY then loads them, so seq order is exactly occurredAt order.
+- `TRUNCATE events RESTART IDENTITY` runs before the load. The service's
+  snapshot check (phase 3) then discards a stale snapshot.
+- `VACUUM (ANALYZE) events` runs after the load. It sets hint bits and the
+  visibility map now, instead of during the service's first replay, and gives
+  the planner statistics.
+- Event IDs are zero-padded (`g-00000001`) so that the `event_id` index fills
+  roughly in order. Background IDs use `p%07d`, `d%07d`, `pm%07d`, which caps
+  players at 3,333,333.
+
+Planted scenarios:
+
+- Planted IDs use a `pl-` / `dpl-` prefix, outside the background ID space
+  that the load test draws from. Load traffic therefore can't change their outcome.
+- Some rules have no numeric threshold. For those, "exact-threshold" and
+  "one-below" mean:
+  - R3 (time window): exact = the three components once each, the oldest 50
+    min old; one-below = two of three (device seen before, or no reset).
+  - R5 (set membership): the firing case uses a method seen only in a
+    declined deposit; the non-firing case uses one from an approved deposit.
+    Unknown-player and never-seen-method cases are added.
+  - The manifest's `kind` field says which is which.
+- Timing: R1 events are at most 60 s old and R3 events at most 50 min old at
+  generation time, so `make verify` must run within about 9 minutes of `make seed`.
+  Planting future-dated events would extend that, but would push the
+  service's pruning clock ahead of real time.
+  - verify always sends `X-Test-Now = generatedAt + 1 min`. With
+    TEST_MODE=true the result is therefore independent of when it runs;
+    otherwise the header is ignored, and verify warns if the data is over 9
+    minutes old.
+- The manifest is written to the `manifest` volume. `make verify` runs verify
+  in a container against `http://app:8080`; `make manifest` copies the file
+  out to the working directory.
+
+Packaging (needed to measure phase 4 under the SPEC limits):
+
+- One distroless image holds `server`, `generate` and `verify`. The app
+  healthcheck is `server healthcheck`, because distroless has no curl. It has
+  `start_period: 10m` to cover a full replay.
+- The compose project is named `anti-fraud-go`. A project named `anti-fraud`
+  already exists on the dev machine with its own `pgdata` volume.
+- The app also exports `process_resident_memory_bytes` (from `/proc/self/statm`)
+  and Go heap gauges.
+- `GOMEMLIMIT` was tuned from the SPEC's 1500MiB to 1100MiB (`GOGC=200`
+  unchanged); see the measurements below. Both can be overridden from the
+  environment. `SNAPSHOT_PATH=` (empty) disables snapshots, which forces a full replay.
+- After recovery the server calls `State.Trim()` and then
+  `debug.FreeOSMemory()`. Trim shrinks every slice to its length (capacity
+  only, no state change; a test checks this).
+
+## Phase 4 measurements
+
+Machine: Apple M5, 10 cores, 32 GB RAM, macOS 27.2, OrbStack (Docker
+29.8.2, 10 CPUs and 16 GB for the VM). app and db are limited to 2 CPUs and
+2 GB each. The data set is `--players=1000000 --events=10000000 --days=90 --seed=42`.
+
+| What | Result |
+|---|---|
+| Generate + COPY 10M events (one stream, indexes in place) | 40.5 s (247k events/s) |
+| `VACUUM (ANALYZE)` after the load | 6.5 s |
+| `make seed` end to end (load + app restart with full replay) | 48 s + 8 s |
+| Table size | 1,053 MB heap, 1,690 MB with indexes |
+| State | 1,000,045 players, 1,044,360 devices, 1,081,217 payment methods |
+| Full replay of 10M events (2 CPUs) | 7.1 s (~1.4M events/s) |
+| Snapshot file | 95 MB |
+| Snapshot writer pause (encode) / total with fsync and rename | 89 ms / 115 ms |
+| Recovery from the snapshot (0 tail events) | 0.36 s |
+| Live heap after full replay, before / after `Trim` | 618 MB / 541 MB |
+| RSS after full replay, before / after `Trim` + `FreeOSMemory` | 1,334 MB / 663 MB |
+| RSS after recovery from the snapshot | 557 MB |
+| `make verify` (TEST_MODE off, server clock) | 28/28 cases pass, after the full replay and after snapshot recovery |
+
+- The replay query uses `Index Scan using events_pkey` with no sort. The
+  load is in seq order, so the correlation is 1.
+- Where the memory goes (heap profile after loading the snapshot, 511 MB):
+  - Player table: 144 B per player, plus its dictionary: ~200 MB.
+  - Per-player slices: ~65 MB.
+  - Device table and its dictionary: ~126 MB.
+  - Payment-method dictionary: ~74 MB.
+  - ID strings: ~29 MB.
+- Before the fixes, RSS was 1.33 GB. Replay garbage was never returned to
+  the OS, because the scavenger keeps memory up to the GC goal.
+- With ~540 MB live, `GOGC=200` lets the heap grow toward 3× live (capped by
+  `GOMEMLIMIT`). At the SPEC's 1500MiB that would break the 1.2 GB RSS budget
+  under load. At 1100MiB, the GC holds total memory around the limit. Phase 5
+  must confirm RSS and latency under load.
+- Not done, possible if memory is tight:
+  - Hash payment methods to uint64 instead of interning them. This saves the
+    ~74 MB dictionary, but deviates from SPEC §7.
+  - A periodic sweep of stale entries. Per-entity slices are pruned only on
+    append, so an inactive player keeps the bets and declines of its last
+    session (bounded, a few tens of MB).
