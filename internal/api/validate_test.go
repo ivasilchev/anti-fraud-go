@@ -571,6 +571,8 @@ func TestEveryErrorCodeIsProduced(t *testing.T) {
 	_, err = ReadBody(bytes.NewReader(make([]byte, MaxBodyBytes+1)))
 	record(err)
 	record(ErrOverloaded())
+	record(errInternal())
+	record(errNotReady())
 
 	for _, code := range AllCodes {
 		if !seen[code] {

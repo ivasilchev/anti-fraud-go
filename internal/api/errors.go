@@ -18,6 +18,8 @@ const (
 	CodeBatchTooLarge    Code = "BATCH_TOO_LARGE"
 	CodePayloadTooLarge  Code = "PAYLOAD_TOO_LARGE"
 	CodeOverloaded       Code = "OVERLOADED"
+	CodeInternal         Code = "INTERNAL_ERROR"
+	CodeNotReady         Code = "NOT_READY"
 )
 
 // Field-level error codes, reported in Error.Details under VALIDATION_FAILED.
@@ -35,7 +37,7 @@ const (
 // AllCodes lists every error code the API can return.
 var AllCodes = []Code{
 	CodeValidationFailed, CodeInvalidJSON, CodeEmptyBatch, CodeBatchTooLarge,
-	CodePayloadTooLarge, CodeOverloaded,
+	CodePayloadTooLarge, CodeOverloaded, CodeInternal, CodeNotReady,
 	CodeMissingField, CodeInvalidField, CodeUnknownEventType, CodeUnknownAction,
 	CodeInvalidTimestamp, CodeEventInFuture, CodeInvalidAmount, CodeUnsupportedCurrency,
 }
@@ -90,6 +92,14 @@ func errPayloadTooLarge() *Error {
 // ErrOverloaded is returned when the ingest queue is full.
 func ErrOverloaded() *Error {
 	return newError(http.StatusServiceUnavailable, CodeOverloaded, "ingest queue is full, retry later")
+}
+
+func errNotReady() *Error {
+	return newError(http.StatusServiceUnavailable, CodeNotReady, "state is being rebuilt from the event log, retry later")
+}
+
+func errInternal() *Error {
+	return newError(http.StatusInternalServerError, CodeInternal, "internal error, retry later")
 }
 
 func errValidation(details []Detail) *Error {

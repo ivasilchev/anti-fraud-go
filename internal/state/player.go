@@ -134,6 +134,24 @@ func (p *Player) ApplyVoid(idHash uint64) bool {
 	return false
 }
 
+// ApplyVoidOutOfWindow handles a void whose bet (at t, amountEUR) is no longer
+// in RecentBets: it is removed from turnover if it was counted.
+func (p *Player) ApplyVoidOutOfWindow(t, amountEUR int64) {
+	if t >= p.LastDepositT {
+		p.TurnoverEUR -= amountEUR
+	}
+}
+
+// FindBet returns the bet with idHash from RecentBets.
+func (p *Player) FindBet(idHash uint64) (Bet, bool) {
+	for _, b := range p.RecentBets {
+		if b.IDHash == idHash {
+			return b, true
+		}
+	}
+	return Bet{}, false
+}
+
 // ApplyPasswordReset records a PASSWORD_RESET (max-of).
 func (p *Player) ApplyPasswordReset(t int64) {
 	p.LastPasswordResetT = max(p.LastPasswordResetT, t)
