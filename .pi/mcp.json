@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "uvx",
+      "cwd": ".",
+      "args": [
+        "--overrides",
+        ".pi/postgres-mcp-overrides.txt",
+        "postgres-mcp==0.3.0",
+        "--access-mode=restricted"
+      ],
+      "env": {
+        "DATABASE_URI": "postgresql://antifraud:antifraud@localhost:5432/antifraud"
+      }
+    }
+  }
+}
