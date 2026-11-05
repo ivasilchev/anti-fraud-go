@@ -228,14 +228,16 @@ func (s *Store) StreamEvents(ctx context.Context, afterSeq int64, fn func(seq in
 	return nil
 }
 
-// EventIDAt returns the eventId stored at seq, or ok == false if there is none.
-func (s *Store) EventIDAt(ctx context.Context, seq int64) (id string, ok bool, err error) {
-	err = s.pool.QueryRow(ctx, `SELECT event_id FROM events WHERE seq = $1`, seq).Scan(&id)
+// WatermarkAt returns the event stored at seq, or ok == false if there is none.
+func (s *Store) WatermarkAt(ctx context.Context, seq int64) (mark state.Watermark, ok bool, err error) {
+	var at time.Time
+	err = s.pool.QueryRow(ctx, `SELECT event_id, occurred_at FROM events WHERE seq = $1`, seq).Scan(&mark.EventID, &at)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return state.Watermark{}, false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("event at seq %d: %w", seq, err)
+		return state.Watermark{}, false, fmt.Errorf("event at seq %d: %w", seq, err)
 	}
-	return id, true, nil
+	mark.Seq, mark.OccurredAt = seq, at.UnixMilli()
+	return mark, true, nil
 }

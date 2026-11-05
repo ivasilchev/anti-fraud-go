@@ -93,10 +93,9 @@ type State struct {
 	Pending *PendingVoids
 
 	// Writer-only bookkeeping, persisted in snapshots.
-	clock        int64  // latest applied occurredAt (unix ms)
-	lastSeq      int64  // seq of the last applied event
-	lastEventID  string // eventId of the last applied event
-	prunedBucket int64  // see pendingBucket
+	clock        int64     // latest applied occurredAt (unix ms)
+	mark         Watermark // last applied event
+	prunedBucket int64     // see pendingBucket
 }
 
 // New returns an empty state.

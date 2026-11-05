@@ -35,7 +35,7 @@ func Replay(ctx context.Context, log ReplayLog, st *state.State, chunk int) (int
 	if chunk <= 0 {
 		chunk = DefaultReplayChunk
 	}
-	after, _ := st.Watermark()
+	after := st.Watermark().Seq
 	var (
 		n      int64
 		events = make([]state.Event, 0, chunk)
@@ -80,8 +80,8 @@ func Replay(ctx context.Context, log ReplayLog, st *state.State, chunk int) (int
 // RecoveryLog is the durable log as seen by startup recovery.
 type RecoveryLog interface {
 	ReplayLog
-	// EventIDAt returns the eventId at seq, or ok == false if there is none.
-	EventIDAt(ctx context.Context, seq int64) (id string, ok bool, err error)
+	// WatermarkAt returns the event at seq, or ok == false if there is none.
+	WatermarkAt(ctx context.Context, seq int64) (mark state.Watermark, ok bool, err error)
 }
 
 // RecoverStats describes a startup recovery.
@@ -97,8 +97,8 @@ type RecoverStats struct {
 // Recover rebuilds the state: it loads the snapshot at snapshotPath (if any,
 // and if it matches the log) and replays the events logged after it. An empty
 // snapshotPath means a full replay. A snapshot that is corrupt, of another
-// version, or taken from a different log (its watermark event is not in the
-// log) is ignored: Postgres is the source of truth.
+// version, or taken from a different log (the event at its watermark seq has
+// another eventId or occurredAt) is ignored: Postgres is the source of truth.
 func Recover(ctx context.Context, log RecoveryLog, snapshotPath string, chunk int) (*state.State, RecoverStats, error) {
 	start := time.Now()
 	var stats RecoverStats
@@ -110,7 +110,7 @@ func Recover(ctx context.Context, log RecoveryLog, snapshotPath string, chunk in
 	if st == nil {
 		st = state.New()
 	} else {
-		stats.SnapshotSeq, _ = st.Watermark()
+		stats.SnapshotSeq = st.Watermark().Seq
 	}
 	stats.Replayed, err = Replay(ctx, log, st, chunk)
 	stats.Duration = time.Since(start)
@@ -130,16 +130,17 @@ func loadSnapshot(ctx context.Context, log RecoveryLog, path string) (*state.Sta
 		slog.Warn("ignoring snapshot", "path", path, "err", err)
 		return nil, err.Error(), nil
 	}
-	seq, eventID := st.Watermark()
-	if seq == 0 {
+	want := st.Watermark()
+	if want.Seq == 0 {
 		return st, "", nil
 	}
-	got, ok, err := log.EventIDAt(ctx, seq)
+	got, ok, err := log.WatermarkAt(ctx, want.Seq)
 	if err != nil {
 		return nil, "", err
 	}
-	if !ok || got != eventID {
-		reason := fmt.Sprintf("snapshot watermark seq %d (%q) is not in the log (found %q)", seq, eventID, got)
+	if !ok || got != want {
+		reason := fmt.Sprintf("snapshot watermark seq %d (%q at %d) is not in the log (found %q at %d)",
+			want.Seq, want.EventID, want.OccurredAt, got.EventID, got.OccurredAt)
 		slog.Warn("ignoring snapshot", "path", path, "reason", reason)
 		return nil, reason, nil
 	}

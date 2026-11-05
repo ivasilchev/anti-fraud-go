@@ -17,7 +17,7 @@ import (
 // Snapshot file layout (all integers are varints unless noted):
 //
 //	magic "AFGOSNAP" | version uint32 LE
-//	lastSeq | lastEventID | clock
+//	watermark seq | watermark eventId | watermark occurredAt | clock
 //	methods: 256 x (count, count x id)
 //	devices: 256 x (count, count x device)
 //	players: 256 x (count, count x player)
@@ -28,7 +28,7 @@ import (
 // the same index. Encoding is canonical: equal states give equal bytes.
 const (
 	snapshotMagic   = "AFGOSNAP"
-	SnapshotVersion = 1
+	SnapshotVersion = 2
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -47,8 +47,9 @@ func (s *State) WriteSnapshot(w io.Writer) error {
 
 	buf = append(buf, snapshotMagic...)
 	buf = binary.LittleEndian.AppendUint32(buf, SnapshotVersion)
-	buf = binary.AppendVarint(buf, s.lastSeq)
-	buf = appendString(buf, s.lastEventID)
+	buf = binary.AppendVarint(buf, s.mark.Seq)
+	buf = appendString(buf, s.mark.EventID)
+	buf = binary.AppendVarint(buf, s.mark.OccurredAt)
 	buf = binary.AppendVarint(buf, s.clock)
 	var err error
 	if buf, err = flushBuf(out, buf); err != nil {
@@ -177,8 +178,9 @@ func ReadSnapshot(data []byte) (*State, error) {
 
 	d := decoder{b: body[hdr:]}
 	s := New()
-	s.lastSeq = d.varint()
-	s.lastEventID = d.string()
+	s.mark.Seq = d.varint()
+	s.mark.EventID = d.string()
+	s.mark.OccurredAt = d.varint()
 	s.clock = d.varint()
 	s.prunedBucket = pendingBucket(s.clock)
 

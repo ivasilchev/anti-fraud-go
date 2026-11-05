@@ -156,8 +156,7 @@ func run() error {
 	st.Trim()
 	debug.FreeOSMemory()
 	players, devices, methods := st.Counts()
-	seq, _ := st.Watermark()
-	slog.Info("recovered", "snapshotSeq", stats.SnapshotSeq, "replayed", stats.Replayed, "watermark", seq,
+	slog.Info("recovered", "snapshotSeq", stats.SnapshotSeq, "replayed", stats.Replayed, "watermark", st.Watermark().Seq,
 		"players", players, "devices", devices, "methods", methods, "duration", stats.Duration)
 	m.ReplayedEvents.Store(stats.Replayed)
 	m.ReplayMicros.Store(stats.Duration.Microseconds())

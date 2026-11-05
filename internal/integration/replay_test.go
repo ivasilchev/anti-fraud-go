@@ -143,30 +143,27 @@ func TestSnapshotFromAnotherLogIsIgnored(t *testing.T) {
 		t.Logf("%s: %s", name, stats.SnapshotSkipped)
 	}
 
-	// The log is reseeded: same seqs, other events (make seed truncates).
-	if _, err := a.db.Pool().Exec(ctx, "TRUNCATE events RESTART IDENTITY"); err != nil {
-		t.Fatal(err)
-	}
-	var other []state.Event
-	for _, e := range scenario("z-") {
-		ms, err := time.Parse(time.RFC3339Nano, e["occurredAt"].(string))
-		if err != nil {
+	reseed := func(events []state.Event) {
+		t.Helper()
+		if _, err := a.db.Pool().Exec(ctx, "TRUNCATE events RESTART IDENTITY"); err != nil {
 			t.Fatal(err)
 		}
-		ev := state.Event{EventID: e["eventId"].(string), PlayerID: e["playerId"].(string), OccurredAt: ms.UnixMilli()}
-		ev.Type, _ = state.ParseEventType(e["type"].(string))
-		if amt, ok := e["amount"].(string); ok {
-			ev.AmountE4, _ = money.ParseE4(amt)
-			ev.AmountEURE4, ev.Currency = ev.AmountE4, money.EUR
+		if _, err := a.db.InsertEvents(ctx, events); err != nil {
+			t.Fatal(err)
 		}
-		ev.DeviceID, _ = e["deviceId"].(string)
-		ev.PaymentMethodID, _ = e["paymentMethodId"].(string)
-		ev.VoidedEventID, _ = e["voidedEventId"].(string)
-		other = append(other, ev)
 	}
-	if _, err := a.db.InsertEvents(ctx, other); err != nil {
-		t.Fatal(err)
+
+	// The log is reseeded with the same eventIds at the same seqs but other
+	// times, as a second make seed with the same parameters does.
+	reseed(logEvents(t, scenario("a-"), time.Second))
+	want := a.st.Watermark()
+	if m, ok, err := a.db.WatermarkAt(ctx, want.Seq); err != nil || !ok || m.EventID != want.EventID {
+		t.Fatalf("setup: event at the watermark = %+v, %v, %v; want eventId %q", m, ok, err, want.EventID)
 	}
+	check("reseeded log, same eventIds")
+
+	// The log is reseeded: same seqs, other events (make seed truncates).
+	reseed(logEvents(t, scenario("z-"), 0))
 	check("reseeded log")
 
 	// The log was truncated and is now shorter than the snapshot.
@@ -180,4 +177,27 @@ func TestSnapshotFromAnotherLogIsIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("corrupt snapshot")
+}
+
+// logEvents converts API events to log events, shifted in time by shift.
+func logEvents(t *testing.T, events []ev, shift time.Duration) []state.Event {
+	t.Helper()
+	out := make([]state.Event, 0, len(events))
+	for _, e := range events {
+		at, err := time.Parse(time.RFC3339Nano, e["occurredAt"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		le := state.Event{EventID: e["eventId"].(string), PlayerID: e["playerId"].(string), OccurredAt: at.Add(shift).UnixMilli()}
+		le.Type, _ = state.ParseEventType(e["type"].(string))
+		if amt, ok := e["amount"].(string); ok {
+			le.AmountE4, _ = money.ParseE4(amt)
+			le.AmountEURE4, le.Currency = le.AmountE4, money.EUR
+		}
+		le.DeviceID, _ = e["deviceId"].(string)
+		le.PaymentMethodID, _ = e["paymentMethodId"].(string)
+		le.VoidedEventID, _ = e["voidedEventId"].(string)
+		out = append(out, le)
+	}
+	return out
 }

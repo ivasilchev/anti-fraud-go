@@ -70,8 +70,10 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if !bytes.Equal(encode(t, got), data) {
 		t.Fatal("re-encoded snapshot differs")
 	}
-	if seq, id := got.Watermark(); seq != int64(len(richEvents())) || id != "e38" {
-		t.Fatalf("watermark = %d %q", seq, id)
+	events := richEvents()
+	want := Watermark{Seq: int64(len(events)), EventID: "e38", OccurredAt: events[len(events)-1].OccurredAt}
+	if m := got.Watermark(); m != want {
+		t.Fatalf("watermark = %+v, want %+v", m, want)
 	}
 	gp, gd, gm := got.Counts()
 	sp, sd, sm := s.Counts()
@@ -103,8 +105,8 @@ func TestSnapshotOfEmptyState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seq, _ := got.Watermark(); seq != 0 {
-		t.Fatalf("watermark = %d", seq)
+	if m := got.Watermark(); m != (Watermark{}) {
+		t.Fatalf("watermark = %+v", m)
 	}
 }
 
@@ -119,7 +121,9 @@ func TestReadSnapshotRejectsDamage(t *testing.T) {
 	flipped := bytes.Clone(good)
 	flipped[len(flipped)/2] ^= 1
 	version := bytes.Clone(good)
-	version[len(snapshotMagic)] = 2
+	version[len(snapshotMagic)] = SnapshotVersion + 1
+	v1 := bytes.Clone(good)
+	v1[len(snapshotMagic)] = 1
 	trailing := withCRC(append(bytes.Clone(good[:len(good)-4]), 7, 0, 0, 0, 0)) // one extra byte
 	truncated := withCRC(append(bytes.Clone(good[:len(good)/2]), 0, 0, 0, 0))
 
@@ -128,6 +132,7 @@ func TestReadSnapshotRejectsDamage(t *testing.T) {
 		"magic":      append([]byte("NOTASNAP"), good[8:]...),
 		"checksum":   flipped,
 		"version":    version,
+		"version 1":  v1,
 		"trailing":   trailing,
 		"truncated":  truncated,
 		"tiny":       good[:10],

@@ -213,10 +213,14 @@ Snapshots:
     measures it at 1M players.
 - A snapshot is skipped when nothing was applied since the last one written
   or loaded.
-- At startup, the snapshot is used only if `event_id` at its watermark seq
-  matches the one it recorded.
+- At startup, the snapshot is used only if the event at its watermark seq
+  has the `event_id` and `occurred_at` it recorded.
   - This detects a truncated or reseeded log (`make seed`, even with
-    `RESTART IDENTITY`). A corrupt or wrong-version file is also ignored.
+    `RESTART IDENTITY`). Comparing `event_id` alone was not enough: the
+    generator gives the same IDs in the same order for the same parameters,
+    and only the timestamps move with the generation time. Snapshot format
+    version 2 adds the watermark's occurredAt.
+  - A corrupt or wrong-version file is also ignored.
   - An ignored snapshot means a full replay, logged as a warning.
 - Loading reads the whole file into memory once (transient, about the
   snapshot size).

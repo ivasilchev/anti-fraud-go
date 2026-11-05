@@ -183,7 +183,7 @@ func TestFailedFlushThatCommittedIsCaughtUpBeforeTheNextFlush(t *testing.T) {
 	if _, err := w.Submit(ctx, bets("a", "b"), 1); err == nil {
 		t.Fatal("want the flush error")
 	}
-	if seq, _ := st.Watermark(); seq != 0 {
+	if seq := st.Watermark().Seq; seq != 0 {
 		t.Fatalf("watermark = %d after a failed flush, want 0", seq)
 	}
 
@@ -196,8 +196,8 @@ func TestFailedFlushThatCommittedIsCaughtUpBeforeTheNextFlush(t *testing.T) {
 	if err != nil || res != (Result{Accepted: 1, Duplicates: 2}) {
 		t.Fatalf("got %+v, %v", res, err)
 	}
-	if seq, id := st.Watermark(); seq != 3 || id != "c" {
-		t.Fatalf("watermark = %d %q, want 3 \"c\"", seq, id)
+	if m := st.Watermark(); m.Seq != 3 || m.EventID != "c" {
+		t.Fatalf("watermark = %d %q, want 3 \"c\"", m.Seq, m.EventID)
 	}
 	v := st.Acquire("p1", "", "")
 	defer v.Release()

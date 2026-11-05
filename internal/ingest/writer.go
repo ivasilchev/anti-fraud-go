@@ -359,7 +359,7 @@ func (w *Writer) Snapshot(path string) (SnapshotInfo, error) {
 	)
 	err := w.Pause(func() error {
 		pauseStart := time.Now()
-		info.Seq, _ = w.st.Watermark()
+		info.Seq = w.st.Watermark().Seq
 		if info.Seq == w.lastSnapshotSeq.Load() {
 			info.Skipped = true
 			return nil

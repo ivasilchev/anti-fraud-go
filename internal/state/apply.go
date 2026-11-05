@@ -28,9 +28,17 @@ type BetRef struct {
 	Seq int64
 }
 
-// Watermark returns the seq and eventId of the last applied event. seq is 0
-// when nothing has been applied.
-func (s *State) Watermark() (seq int64, eventID string) { return s.lastSeq, s.lastEventID }
+// Watermark identifies the last applied event. Seq is 0 when nothing has
+// been applied. OccurredAt tells a reseeded log apart from the original even
+// when it reuses the same seqs and eventIds.
+type Watermark struct {
+	Seq        int64
+	EventID    string
+	OccurredAt int64 // unix ms
+}
+
+// Watermark returns the last applied event.
+func (s *State) Watermark() Watermark { return s.mark }
 
 // pruneNow is the reference time for pruning per-entity slices and pending
 // voids: the latest applied occurredAt minus MaxFutureMs. Every accepted event
@@ -101,7 +109,7 @@ func (s *State) Apply(rows []Row, refs map[string]BetRef) (late int) {
 		}
 		s.clock = max(s.clock, r.Event.OccurredAt)
 		s.apply(r, refs, s.pruneNow())
-		s.lastSeq, s.lastEventID = r.Seq, r.Event.EventID
+		s.mark = Watermark{Seq: r.Seq, EventID: r.Event.EventID, OccurredAt: r.Event.OccurredAt}
 		if b := pendingBucket(s.clock); b > s.prunedBucket {
 			s.Pending.Prune(s.pruneNow())
 			s.prunedBucket = b
