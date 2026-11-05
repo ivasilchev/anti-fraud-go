@@ -356,3 +356,86 @@ Machine: Apple M5, 10 cores, 32 GB RAM, macOS 27.2, OrbStack (Docker
   - A periodic sweep of stale entries. Per-entity slices are pruned only on
     append, so an inactive player keeps the bets and declines of its last
     session (bounded, a few tens of MB).
+
+## Additional assumptions (phase 5)
+
+Load test (`load/k6.js`, `make load` → `scripts/load.sh`):
+
+- The events load is two constant-arrival-rate scenarios, `events_single`
+  (1,500 req/s) and `events_batch` (30 req/s × 50 events), plus `decisions`
+  (500 req/s) and `visibility` (2 it/s). All four run concurrently for
+  `DURATION` (default 10m; shorter runs are allowed for iteration only).
+- `RUN_ID` defaults to the unix time and is passed in by `scripts/load.sh`,
+  because `handleSummary` cannot see `setup()` data.
+- Event IDs are `lt-<runId>-<vu>-<iter>-<i>`. The visibility players are
+  `lt-<runId>-vis-<vu>-<iter>`, so they are fresh each run.
+- Background players are drawn uniformly from `p0000001…p<PLAYERS>`. Each
+  event uses that player's primary device and one of its 3 payment-method IDs.
+- The event-type mix is roughly LOGIN 15%, deposits 16%, BET 40%, WIN 21%,
+  BET_VOIDED 1% (of the VU's last bet), PASSWORD_RESET 1%,
+  PAYOUT_METHOD_ADDED 1%, WITHDRAWAL_REQUESTED 5%.
+- Duplicates: 1% of events are exact resends of one of the VU's last 50
+  events. A resend that would repeat an eventId already in the same batch is
+  replaced, so batches always have 50 distinct IDs; in-batch duplicates are
+  covered by the integration tests. `resent_events` (k6) must match the
+  server's `duplicate_events_total` delta.
+- The lost-event check counts unique accepted events as the sum of the
+  server-reported `accepted` over all 200 responses (`accepted_events`
+  counter). It compares that sum with
+  `SELECT count(*) … WHERE event_id LIKE 'lt-<runId>-%'`. A request that
+  timed out client-side but committed would show up as a difference: the
+  check is strict in both directions.
+- The visibility iteration posts the 5 declines as one batch and then asks
+  for a decision. The timer covers both requests.
+- `scripts/load.sh` also samples the app's RSS and queue depth every 5 s. It
+  then prints the k6 table plus server-side numbers (RSS peak, flush latency,
+  late events, duplicates, snapshots), and exits non-zero if either the
+  thresholds or the lost-event check fail.
+- k6 runs in compose profile `load` (`grafana/k6:2.3.0`), limited to 4 CPUs
+  and 2 GB, on the same Docker host as app and db. Results go to
+  `load/results/` (git-ignored).
+
+## Phase 5 results
+
+Full run: `make load`, 10 minutes, on the phase 4 data set (10M events,
+1M players) and the same machine and limits (app and db at 2 CPUs / 2 GB
+each, k6 at 4 CPUs). TEST_MODE was off; PPROF=1 was on for profiling.
+
+| Metric | Result | Threshold |
+|---|---|---|
+| Requests | 1,220,369 (2,034/s) | |
+| Events accepted (unique) | 1,792,320 (2,987/s) | ~3,000/s |
+| Decisions | 300,000 (500/s) | 500/s |
+| Decision latency p50 / p95 / p99 / max | 0.24 / 1.02 / 2.00 / 82.4 ms | p95 < 30, p99 < 80 ✅ |
+| All requests p50 / p95 / p99 | 7.9 / 14.5 / 17.5 ms | |
+| Error rate | 0.0000% (0 failed) | < 0.1% ✅ |
+| Visibility success / p50 / p99 / max | 100% / 11 / 19 / 32 ms | 100%, p99 < 1000 ✅ |
+| Lost events | 0 (1,792,320 accepted = 1,792,320 in Postgres) | 0 ✅ |
+| Duplicates resent / reported by the server | 13,698 / 13,698 | |
+| Late events (> 5 min) | 6 | |
+| App RSS at the end / peak (5 s samples) | 1,013 / 1,032 MiB | < 1.2 GB ✅ |
+| Ingest queue depth peak | 72 events (capacity 50,000) | |
+| Flushes / mean flush latency | 75,284 / 2.80 ms | |
+| Snapshots during the run / writer pause | 2 / 104 ms and 109 ms | |
+| k6 dropped iterations | 34 of 1.22M | |
+
+- Profile (60 s of CPU at minute 4): the app used about 0.19 of its 2 cores.
+  - About 25% of samples are network syscalls.
+  - `handleEvents` is 21%, of which JSON parsing (`ParseEvents`) is 12%.
+  - The writer's `flush` is 18%, of which the Postgres insert is 9%.
+  - Decisions barely register.
+  - No change was needed to pass the thresholds, so the code was left as it
+    was: there is no hot spot worth trading clarity for. goccy/go-json
+    (SPEC §2) is not warranted: JSON is not the bottleneck.
+- The 34 dropped iterations happen at k6 start-up: a 1-minute run dropped 33.
+  k6 is still opening connections and allocating VUs then. They are 0.003% of
+  the iterations, and the achieved rates match the targets.
+- The 6 late events are fresh events dated almost exactly 300 s ago. With
+  queueing and flush delay they arrive a few ms past the 5-minute mark.
+- The decision max of 82 ms is a single outlier. p99 is 2 ms, and the
+  1-minute run's max was 20 ms. Snapshots don't block decisions (read locks
+  only), so the likely cause is GC or CPU contention on the 2-CPU limit.
+- A snapshot pauses the writer for ~105 ms at 1.1M players. In-flight event
+  requests wait that long, which shows up in the event-request max but not in
+  visibility p99.
+- RSS settles around 1.0 GB, below the 1.2 GB target, with `GOMEMLIMIT=1100MiB`.

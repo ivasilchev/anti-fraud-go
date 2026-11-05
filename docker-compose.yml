@@ -102,6 +102,24 @@ services:
     volumes:
       - manifest:/manifest
 
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["load"]
+    command: ["run", "--quiet", "/load/k6.js"]
+    environment:
+      BASE_URL: http://app:8080
+      RUN_ID: ${RUN_ID:-}
+      DURATION: ${DURATION:-10m}
+      PLAYERS: ${PLAYERS:-1000000}
+    volumes:
+      - ./load:/load:ro
+      - ./load/results:/results
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2g
+
 volumes:
   pgdata:
   snapshots:

@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER_HOST ?= $(shell docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)
 export DOCKER_HOST
 
-.PHONY: up down build seed recovery verify test bench manifest
+.PHONY: up down build seed recovery verify test bench manifest load
 
 build:
 	$(COMPOSE) build app
@@ -41,3 +41,7 @@ test:
 
 bench:
 	go test -run '^$$' -bench . -benchmem ./internal/...
+
+# k6 load test (DURATION=10m by default), lost-event check, results table.
+load:
+	scripts/load.sh
