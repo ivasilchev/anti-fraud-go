@@ -26,7 +26,7 @@ Validation and errors:
   top-level codes with empty `details`.
 - `details[].index` is the event position (0 for a single-object body). It is
   omitted for decision requests.
-- `PAYLOAD_TOO_LARGE` returns HTTP 413. Body limit is 1 MiB (1,048,576 bytes); exactly 1 MiB is accepted.
+- `PAYLOAD_TOO_LARGE` returns HTTP 400, like every other invalid input. Body limit is 1 MiB (1,048,576 bytes); exactly 1 MiB is accepted.
 - A missing field or JSON `null` is `MISSING_FIELD`. A present but empty, too
   long or non-string ID is `INVALID_FIELD`. "64 characters" counts Unicode code points.
 - `ip` gets the same non-empty and length check as IDs. Its format is not validated.

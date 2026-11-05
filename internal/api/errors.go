@@ -85,7 +85,7 @@ func errInvalidJSON(msg string) *Error {
 }
 
 func errPayloadTooLarge() *Error {
-	return newError(http.StatusRequestEntityTooLarge, CodePayloadTooLarge,
+	return newError(http.StatusBadRequest, CodePayloadTooLarge,
 		"request body exceeds "+strconv.Itoa(MaxBodyBytes)+" bytes")
 }
 

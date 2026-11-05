@@ -408,7 +408,7 @@ func TestParseEventsBatchIsAllOrNothing(t *testing.T) {
 func TestReadBody(t *testing.T) {
 	t.Run("PAYLOAD_TOO_LARGE over 1 MB", func(t *testing.T) {
 		_, err := ReadBody(bytes.NewReader(make([]byte, MaxBodyBytes+1)))
-		assertTopLevel(t, err, http.StatusRequestEntityTooLarge, CodePayloadTooLarge)
+		assertTopLevel(t, err, http.StatusBadRequest, CodePayloadTooLarge)
 	})
 	t.Run("exactly 1 MB accepted", func(t *testing.T) {
 		b, err := ReadBody(bytes.NewReader(make([]byte, MaxBodyBytes)))
