@@ -48,6 +48,9 @@ export const options = {
     http_req_failed: ['rate<0.001'],
     visibility_ok: ['rate==1'],
     visibility_ms: ['p(99)<1000'],
+    // Arrival-rate executors skip iterations when no VU is free; any skip
+    // means the target rates were not offered and latencies look too good.
+    dropped_iterations: ['count==0'],
   },
 };
 
@@ -220,7 +223,8 @@ export function handleSummary(data) {
     ['events accepted (unique)', `${accepted} (${fmt(accepted / secs, 0)}/s)`, ''],
     ['duplicates reported / resent', `${v('duplicate_events').count || 0} / ${v('resent_events').count || 0}`, ''],
     ['decisions', `${dec.count} (${fmt(dec.count / secs, 0)}/s)`, ''],
-    ['dropped iterations (k6 could not keep the rate)', `${v('dropped_iterations').count || 0}`, ''],
+    ['dropped iterations (k6 could not keep the rate)', `${v('dropped_iterations').count || 0}`,
+      thresholdsOK(m.dropped_iterations) || 'pass'],
     ['decision latency p50 / p95 / p99 / max (ms)',
       `${fmt(dec.med, 2)} / ${fmt(dec['p(95)'], 2)} / ${fmt(dec['p(99)'], 2)} / ${fmt(dec.max, 2)}`,
       thresholdsOK(m['http_req_duration{scenario:decisions}'])],
