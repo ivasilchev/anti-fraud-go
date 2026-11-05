@@ -39,9 +39,13 @@ type Metrics struct {
 	SnapshotBytes       atomic.Int64
 	SnapshotPauseMicros atomic.Int64 // writer pause of the last snapshot
 
-	// QueueDepth reports the number of events waiting to be flushed.
-	QueueDepth func() int64
+	// queueDepth reports the number of events waiting to be flushed. It is
+	// set after recovery, while /metrics is already being served.
+	queueDepth atomic.Pointer[func() int64]
 }
+
+// SetQueueDepth sets the function that reports the ingest queue depth.
+func (m *Metrics) SetQueueDepth(f func() int64) { m.queueDepth.Store(&f) }
 
 // codeCounters is a fixed set of per-code counters. Codes are registered up
 // front, so counting needs no lock.
@@ -146,8 +150,8 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 	}
 
 	var depth int64
-	if m.QueueDepth != nil {
-		depth = m.QueueDepth()
+	if f := m.queueDepth.Load(); f != nil {
+		depth = (*f)()
 	}
 	b = append(b, "# HELP ingest_queue_depth Events waiting to be flushed.\n# TYPE ingest_queue_depth gauge\ningest_queue_depth "...)
 	b = strconv.AppendInt(b, depth, 10)

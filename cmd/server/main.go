@@ -163,7 +163,7 @@ func run() error {
 	m.SnapshotLoadSeq.Store(stats.SnapshotSeq)
 
 	w := ingest.New(db, st, m, ingest.Config{})
-	m.QueueDepth = w.QueueDepth
+	m.SetQueueDepth(w.QueueDepth)
 	if stats.SnapshotSeq > 0 && stats.Replayed == 0 {
 		w.MarkSnapshot(stats.SnapshotSeq)
 	}
