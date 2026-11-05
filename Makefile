@@ -29,8 +29,13 @@ seed: build
 recovery:
 	@curl -fsS http://localhost:8080/metrics | grep -E '^(startup_|process_resident|go_memstats_heap)'
 
+# Restarts the app with TEST_MODE=true so verify can pin the clock to the
+# seed time (X-Test-Now): the planted R1/R3 cases then pass at any time.
+# The app is restarted with TEST_MODE=false afterwards, even on failure.
 verify:
-	$(COMPOSE) --profile generate run --rm verify
+	TEST_MODE=true $(COMPOSE) up -d --wait app
+	$(COMPOSE) --profile generate run --rm verify; status=$$?; \
+		TEST_MODE=false $(COMPOSE) up -d --wait app && exit $$status
 
 # Copy the manifest out of its volume, e.g. for running verify on the host.
 manifest:

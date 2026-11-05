@@ -296,13 +296,17 @@ Planted scenarios:
     Unknown-player and never-seen-method cases are added.
   - The manifest's `kind` field says which is which.
 - Timing: R1 events are at most 60 s old and R3 events at most 50 min old at
-  generation time, so `make verify` must run within about 9 minutes of `make seed`.
+  generation time, so on the server clock verify must run within about 9
+  minutes of `make seed`.
   Planting future-dated events would extend that, but would push the
   service's pruning clock ahead of real time.
   - verify always sends `X-Test-Now = generatedAt + 1 min`. With
     TEST_MODE=true the result is therefore independent of when it runs;
     otherwise the header is ignored, and verify warns if the data is over 9
     minutes old.
+  - `make verify` therefore restarts the app with `TEST_MODE=true`, runs
+    verify, and restarts it with `TEST_MODE=false` again, also on failure. Planted entities get no load traffic,
+    so their slices are never pruned and the pinned clock still sees them.
 - The manifest is written to the `manifest` volume. `make verify` runs verify
   in a container against `http://app:8080`; `make manifest` copies the file
   out to the working directory.
@@ -343,7 +347,7 @@ Machine: Apple M5, 10 cores, 32 GB RAM, macOS 27.2, OrbStack (Docker
 | Live heap after full replay, before / after `Trim` | 618 MB / 541 MB |
 | RSS after full replay, before / after `Trim` + `FreeOSMemory` | 1,334 MB / 663 MB |
 | RSS after recovery from the snapshot | 557 MB |
-| `make verify` (TEST_MODE off, server clock) | 28/28 cases pass, after the full replay and after snapshot recovery |
+| `make verify` (TEST_MODE off, server clock; before `make verify` switched to TEST_MODE) | 28/28 cases pass, after the full replay and after snapshot recovery |
 
 - The replay query uses `Index Scan using events_pkey` with no sort. The
   load is in seq order, so the correlation is 1.
