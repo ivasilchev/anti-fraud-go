@@ -452,3 +452,12 @@ each, k6 at 4 CPUs). TEST_MODE was off; PPROF=1 was on for profiling.
   requests wait that long, which shows up in the event-request max but not in
   visibility p99.
 - RSS settles around 1.0 GB, below the 1.2 GB target, with `GOMEMLIMIT=1100MiB`.
+
+## Micro-benchmarks
+
+`make bench` on the phase 4 machine (Apple M5, host Go, no container limits):
+
+| Benchmark | Result |
+|---|---|
+| `BenchmarkDecision` (`rules.Evaluate`, busy player and shared device) | 35 ns/op, 0 allocs |
+| `BenchmarkApply` (PrepareVoids + Apply, 2,000-event flush, load-test mix at 3,000/s over 1M players, after a 10-minute warm-up) | 226 ns/event, 18 allocs per flush |
