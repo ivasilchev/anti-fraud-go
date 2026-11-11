@@ -26,9 +26,10 @@ import (
 )
 
 const (
-	defaultDBPath           = "/data/events.db"
-	defaultSnapshotPath     = "/data/snapshot.bin"
+	defaultDBPath           = "data/events.db"
+	defaultSnapshotPath     = "data/snapshot.bin"
 	defaultSnapshotInterval = 5 * time.Minute
+	defaultHTTPLogInterval  = 10 * time.Second
 )
 
 func main() {
@@ -51,6 +52,10 @@ type config struct {
 	snapshotPath     string // "" disables snapshots
 	snapshotInterval time.Duration
 	testMode, pprof  bool
+	// httpLogInterval is the period of the per-route HTTP summary log; 0
+	// disables it. accessLog logs one line per request.
+	httpLogInterval time.Duration
+	accessLog       bool
 }
 
 func loadConfig() (config, error) {
@@ -61,6 +66,8 @@ func loadConfig() (config, error) {
 		snapshotInterval: defaultSnapshotInterval,
 		testMode:         os.Getenv("TEST_MODE") == "true",
 		pprof:            os.Getenv("PPROF") == "1",
+		httpLogInterval:  defaultHTTPLogInterval,
+		accessLog:        os.Getenv("ACCESS_LOG") == "1",
 	}
 	if c.dbPath == "" {
 		c.dbPath = defaultDBPath
@@ -77,6 +84,13 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("SNAPSHOT_INTERVAL %q: want a positive duration", v)
 		}
 		c.snapshotInterval = d
+	}
+	if v := os.Getenv("HTTP_LOG_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return c, fmt.Errorf("HTTP_LOG_INTERVAL %q: want a duration, 0 to disable", v)
+		}
+		c.httpLogInterval = d
 	}
 	if c.snapshotPath != "" {
 		if fi, err := os.Stat(filepath.Dir(c.snapshotPath)); err != nil || !fi.IsDir() {
@@ -105,16 +119,28 @@ func run() error {
 	m.RegisterRejectCodes(api.RejectCodes())
 	srv := &api.Server{Metrics: m, Now: time.Now, TestMode: cfg.testMode}
 	mux := srv.Handler()
+	routes := api.Routes()
 	if cfg.pprof {
-		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		for p, h := range map[string]http.HandlerFunc{
+			"GET /debug/pprof/":        pprof.Index,
+			"GET /debug/pprof/cmdline": pprof.Cmdline,
+			"GET /debug/pprof/profile": pprof.Profile,
+			"GET /debug/pprof/symbol":  pprof.Symbol,
+			"GET /debug/pprof/trace":   pprof.Trace,
+		} {
+			mux.HandleFunc(p, h)
+			routes = append(routes, p)
+		}
+	}
+	m.HTTP = metrics.NewHTTP(routes)
+	logCtx, stopHTTPLog := context.WithCancel(context.Background())
+	defer stopHTTPLog()
+	if cfg.httpLogInterval > 0 {
+		go m.HTTP.LogSummaries(logCtx, cfg.httpLogInterval)
 	}
 	httpSrv := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           mux,
+		Handler:           api.Instrument(mux, m.HTTP, cfg.accessLog),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -122,7 +148,8 @@ func run() error {
 	// Listen during recovery: /health/live is 200, /health/ready and the API are 503.
 	errc := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "addr", cfg.addr, "testMode", cfg.testMode)
+		slog.Info("listening", "addr", cfg.addr, "testMode", cfg.testMode,
+			"httpLogInterval", cfg.httpLogInterval, "accessLog", cfg.accessLog)
 		errc <- httpSrv.ListenAndServe()
 	}()
 	shutdownHTTP := func() {
@@ -277,8 +304,8 @@ func countEvents(args []string) int {
 	return 0
 }
 
-// healthcheck is the container healthcheck (distroless has no curl): it
-// exits 0 when /health/ready on the local port returns 200.
+// healthcheck exits 0 when /health/ready on the local port returns 200.
+// scripts/app.sh uses it to wait for startup.
 func healthcheck() int {
 	addr := os.Getenv("ADDR")
 	if addr == "" {

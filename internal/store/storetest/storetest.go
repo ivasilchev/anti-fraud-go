@@ -19,6 +19,7 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 	tests := map[string]func(t *testing.T, s store.Store){
 		"InsertSkipsDuplicates":        testInsertSkipsDuplicates,
 		"InsertSkipsSecondVoid":        testInsertSkipsSecondVoid,
+		"InsertSkipsKnownUUID":         testInsertSkipsKnownUUID,
 		"StreamRoundTripsEvents":       testStreamRoundTripsEvents,
 		"StreamAllowsLookupInCallback": testStreamAllowsLookupInCallback,
 		"StreamStopsOnCallbackError":   testStreamStopsOnCallbackError,
@@ -118,10 +119,28 @@ func testInsertSkipsSecondVoid(t *testing.T, s store.Store) {
 	}
 }
 
+func testInsertSkipsKnownUUID(t *testing.T, s store.Store) {
+	a, b, c, d := ev("a", state.EventLogin), ev("b", state.EventLogin), ev("c", state.EventLogin), ev("d", state.EventLogin)
+	a.UUID = [16]byte{15: 1}
+	b.UUID = a.UUID // a different event with a known uuid
+	// c and d have no uuid (zero), like rows from before the column existed:
+	// they never conflict with each other.
+	if in := insert(t, s, a, b, c, d); !slices.Equal(ids(in), []string{"a", "c", "d"}) {
+		t.Fatalf("inserted %v, want [a c d]", ids(in))
+	}
+	e := ev("e", state.EventLogin)
+	e.UUID = a.UUID
+	if in := insert(t, s, e); len(in) != 0 {
+		t.Fatalf("inserted %v across calls, want nothing", ids(in))
+	}
+}
+
 func testStreamRoundTripsEvents(t *testing.T, s store.Store) {
 	full := state.Event{EventID: "e1", PlayerID: "p1", Type: state.EventDepositApproved, OccurredAt: -5,
 		AmountE4: 123_4500, AmountEURE4: 113_5740, Currency: money.USD,
-		DeviceID: "d1", IP: "10.0.0.1", PaymentMethodID: "pm1", VoidedEventID: "x"}
+		DeviceID: "d1", IP: "10.0.0.1", PaymentMethodID: "pm1", VoidedEventID: "x",
+		UUID:       [16]byte{0x01, 0x8f, 0, 0, 0, 0, 0x70, 1, 0x80, 2, 3, 4, 5, 6, 7, 8},
+		ReceivedAt: 1_700_000_000_001, CreatedAt: 1_700_000_000_002, ProcessedAt: 1_700_000_000_003}
 	bare := state.Event{EventID: "e2", PlayerID: "p2", Type: state.EventPasswordReset, OccurredAt: 1_700_000_000_123}
 	in := insert(t, s, full, bare)
 	seqs, events := stream(t, s, 0)

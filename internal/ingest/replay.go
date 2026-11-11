@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"maps"
 	"time"
 
 	"github.com/devastion/anti-fraud-go/internal/state"
@@ -36,27 +35,23 @@ func Replay(ctx context.Context, log ReplayLog, st *state.State, chunk int) (int
 		chunk = DefaultReplayChunk
 	}
 	after := st.Watermark().Seq
+	// Unlike the live writer, a failed bet lookup fails the replay.
+	d := state.NewDispatcher(st, state.ResolveVoids(log.LookupBets))
 	var (
-		n      int64
-		events = make([]state.Event, 0, chunk)
-		seqs   = make([]int64, 0, chunk)
-		rows   = make([]state.Row, 0, chunk)
+		n       int64
+		events  = make([]state.Event, 0, chunk)
+		seqs    = make([]int64, 0, chunk)
+		actions = make([]state.Action, 0, chunk)
 	)
 	apply := func() error {
-		rows = rows[:0]
+		actions = actions[:0]
 		for i := range events {
-			rows = append(rows, state.Row{Seq: seqs[i], Event: &events[i]})
+			actions = append(actions, state.Action{Seq: seqs[i], Event: &events[i]})
 		}
-		refs, missing := st.PrepareVoids(rows)
-		if len(missing) > 0 {
-			found, err := log.LookupBets(ctx, missing)
-			if err != nil {
-				return err
-			}
-			maps.Copy(refs, found)
+		if err := d.Dispatch(ctx, &state.Batch{Actions: actions}); err != nil {
+			return err
 		}
-		st.Apply(rows, refs)
-		n += int64(len(rows))
+		n += int64(len(actions))
 		events, seqs = events[:0], seqs[:0]
 		return nil
 	}

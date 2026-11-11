@@ -1,14 +1,16 @@
 // Load test (SPEC §10). Run through `make load`, which sets RUN_ID and then
-// checks that every accepted event reached Postgres.
+// checks that every accepted event reached the event log.
 //
-// Env: BASE_URL (default http://app:8080), RUN_ID (required), DURATION
-// (default 10m), PLAYERS (default 1000000, the generator's ID space).
+// Env: BASE_URL (default http://localhost:8080), RUN_ID (required), DURATION
+// (default 10m), PLAYERS (default 1000000, the generator's ID space),
+// RESULTS_DIR (default load/results, relative to the working directory).
 import http from 'k6/http';
 import exec from 'k6/execution';
 import { check } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
 
-const BASE_URL = __ENV.BASE_URL || 'http://app:8080';
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
+const RESULTS_DIR = __ENV.RESULTS_DIR || 'load/results';
 const RUN_ID = __ENV.RUN_ID;
 const DURATION = __ENV.DURATION || '10m';
 const PLAYERS = parseInt(__ENV.PLAYERS || '1000000', 10);
@@ -241,8 +243,8 @@ export function handleSummary(data) {
   const table = rows.map((r) => `${r[0].padEnd(w0)}  ${r[1].padEnd(w1)}  ${r[2]}`).join('\n') + '\n';
   return {
     stdout: table,
-    '/results/table.txt': table,
-    '/results/summary.json': JSON.stringify(data, null, 2),
-    '/results/run.env': `RUN_ID=${RUN_ID}\nACCEPTED=${accepted}\n`,
+    [`${RESULTS_DIR}/table.txt`]: table,
+    [`${RESULTS_DIR}/summary.json`]: JSON.stringify(data, null, 2),
+    [`${RESULTS_DIR}/run.env`]: `RUN_ID=${RUN_ID}\nACCEPTED=${accepted}\n`,
   };
 }

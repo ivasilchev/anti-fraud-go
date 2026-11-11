@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"math/rand/v2"
 	"strconv"
 	"testing"
@@ -73,7 +74,7 @@ func benchBatches(n, size, players int) [][]Event {
 	return out
 }
 
-// BenchmarkApply measures the writer's apply path (PrepareVoids + Apply) for
+// BenchmarkApply measures the writer's dispatch path (ResolveVoids + Reduce) for
 // one 2,000-event flush of the load test's mix and rate over 1M players. The
 // 16 batches repeat every ~11 s of event time, so eventIds recur inside the
 // bets window; voids still resolve within their own batch.
@@ -81,7 +82,9 @@ func BenchmarkApply(b *testing.B) {
 	const size = 2000
 	batches := benchBatches(16, size, 1_000_000)
 	s := New()
-	rows := make([]Row, size)
+	d := NewDispatcher(s, ResolveVoids(func(context.Context, []string) (map[string]BetRef, error) { return nil, nil }))
+	ctx := context.Background()
+	actions := make([]Action, size)
 	events := make([]Event, size)
 	var seq int64
 	base := now
@@ -90,10 +93,11 @@ func BenchmarkApply(b *testing.B) {
 		for i := range events {
 			events[i].OccurredAt += base
 			seq++
-			rows[i] = Row{Seq: seq, Event: &events[i], Now: events[i].OccurredAt}
+			actions[i] = Action{Seq: seq, Event: &events[i], Now: events[i].OccurredAt}
 		}
-		refs, _ := s.PrepareVoids(rows)
-		s.Apply(rows, refs)
+		if err := d.Dispatch(ctx, &Batch{Actions: actions}); err != nil {
+			b.Fatal(err)
+		}
 		base += size / 3
 	}
 	// Warm up: 10 minutes at 3,000 events/s, so the retention windows are full.

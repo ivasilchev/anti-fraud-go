@@ -52,19 +52,19 @@ func (s *Server) SetReady(ready bool) {
 // Handler returns the API routes.
 func (s *Server) Handler() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /events", s.handleEvents)
-	mux.HandleFunc("POST /decisions", s.handleDecision)
-	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(RouteEvents, s.handleEvents)
+	mux.HandleFunc(RouteDecisions, s.handleDecision)
+	mux.HandleFunc(RouteLive, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, []byte(`{"status":"ok"}`))
 	})
-	mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(RouteReady, func(w http.ResponseWriter, _ *http.Request) {
 		if !s.ready.Load() {
 			writeJSON(w, http.StatusServiceUnavailable, []byte(`{"status":"not_ready"}`))
 			return
 		}
 		writeJSON(w, http.StatusOK, []byte(`{"status":"ready"}`))
 	})
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(RouteMetrics, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		if err := s.Metrics.WritePrometheus(w); err != nil {
 			slog.Debug("write metrics", "err", err)
@@ -118,13 +118,64 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, errInternal())
 		return
 	}
-	b := make([]byte, 0, 48)
+	writeJSON(w, http.StatusOK, appendIngestResult(make([]byte, 0, 64+res.Accepted*96), events, res))
+}
+
+// appendIngestResult appends the POST /events response body: the counts and,
+// in request order, the eventId and uuid of each event that was stored.
+func appendIngestResult(b []byte, events []state.Event, res ingest.Result) []byte {
 	b = append(b, `{"accepted":`...)
 	b = strconv.AppendInt(b, int64(res.Accepted), 10)
 	b = append(b, `,"duplicates":`...)
 	b = strconv.AppendInt(b, int64(res.Duplicates), 10)
-	b = append(b, '}')
-	writeJSON(w, http.StatusOK, b)
+	b = append(b, `,"events":[`...)
+	first := true
+	for i, stored := range res.Stored {
+		if !stored {
+			continue
+		}
+		if !first {
+			b = append(b, ',')
+		}
+		first = false
+		b = append(b, `{"eventId":`...)
+		b = appendJSONString(b, events[i].EventID)
+		b = append(b, `,"uuid":"`...)
+		b = appendUUID(b, events[i].UUID)
+		b = append(b, `"}`...)
+	}
+	return append(b, "]}"...)
+}
+
+// appendJSONString appends s as a JSON string. Validated IDs are valid UTF-8
+// without control characters, so only quotes and backslashes need escaping.
+func appendJSONString(b []byte, s string) []byte {
+	b = append(b, '"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			b = append(b, '\\', c)
+		case c < 0x20:
+			b = append(b, `\u00`...)
+			b = append(b, hexDigits[c>>4], hexDigits[c&0xf])
+		default:
+			b = append(b, c)
+		}
+	}
+	return append(b, '"')
+}
+
+const hexDigits = "0123456789abcdef"
+
+// appendUUID appends u in the canonical 8-4-4-4-12 lowercase hex form.
+func appendUUID(b []byte, u [16]byte) []byte {
+	for i, c := range u {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			b = append(b, '-')
+		}
+		b = append(b, hexDigits[c>>4], hexDigits[c&0xf])
+	}
+	return b
 }
 
 var respPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
@@ -150,13 +201,14 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v := s.State.Acquire(req.PlayerID, req.DeviceID, req.PaymentMethodID)
-	dec := rules.Evaluate(rules.Request{
-		Action:             req.Action,
-		PaymentMethod:      v.PM,
-		PaymentMethodKnown: v.PMKnown,
-	}, v.P, v.D, now.UnixMilli())
-	v.Release()
+	var dec rules.Decision
+	s.State.Select(req.PlayerID, req.DeviceID, req.PaymentMethodID, func(v state.View) {
+		dec = rules.Evaluate(rules.Request{
+			Action:             req.Action,
+			PaymentMethod:      v.PM,
+			PaymentMethodKnown: v.PMKnown,
+		}, v.P, v.D, now.UnixMilli())
+	})
 	s.Metrics.Decisions.Add(1)
 
 	bp := respPool.Get().(*[]byte)

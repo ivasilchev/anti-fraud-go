@@ -41,9 +41,9 @@ func richEvents() []Event {
 
 func applyAll(s *State, events []Event, firstSeq int64) {
 	for i := range events {
-		rows := []Row{{Seq: firstSeq + int64(i), Event: &events[i], Now: now}}
-		refs, _ := s.PrepareVoids(rows)
-		s.Apply(rows, refs)
+		actions := []Action{{Seq: firstSeq + int64(i), Event: &events[i], Now: now}}
+		refs, _ := s.PrepareVoids(actions)
+		s.Reduce(&Batch{Actions: actions, Bets: refs})
 	}
 }
 
@@ -170,19 +170,19 @@ func TestSaveAndLoadSnapshotFile(t *testing.T) {
 }
 
 func TestStateDoesNotDependOnReceiveTime(t *testing.T) {
-	// Pruning follows the log clock, so the receive time (Row.Now) only
+	// Pruning follows the log clock, so the receive time (Action.Now) only
 	// affects late counting: a replay (Now = 0) builds the same state.
 	events := richEvents()
 	live, replayed := New(), New()
+	late := 0
+	liveD := NewDispatcher(live, ResolveVoids(notInLog))
+	replayD := NewDispatcher(replayed, CountLate(func(n int) { late += n }), ResolveVoids(notInLog))
 	for i := range events {
-		rows := []Row{{Seq: int64(i + 1), Event: &events[i], Now: now + int64(i)*minute}}
-		refs, _ := live.PrepareVoids(rows)
-		live.Apply(rows, refs)
-		rows[0].Now = 0
-		refs, _ = replayed.PrepareVoids(rows)
-		if late := replayed.Apply(rows, refs); late != 0 {
-			t.Fatalf("replayed rows counted as late: %d", late)
-		}
+		dispatch(t, liveD, Action{Seq: int64(i + 1), Event: &events[i], Now: now + int64(i)*minute})
+		dispatch(t, replayD, Action{Seq: int64(i + 1), Event: &events[i]})
+	}
+	if late != 0 {
+		t.Fatalf("replayed actions counted as late: %d", late)
 	}
 	if !Equal(live, replayed) {
 		t.Fatal("state depends on receive time")

@@ -162,6 +162,15 @@ func (v *View) Release() {
 	v.P, v.D, v.ps, v.ds = nil, nil, nil, nil
 }
 
+// Select runs fn on a read-locked view of a decision's player, device and
+// payment method, and releases the view when fn returns. fn is a selector:
+// it reads the view and must not keep P or D after it returns.
+func (s *State) Select(playerID, deviceID, pmID string, fn func(View)) {
+	v := s.Acquire(playerID, deviceID, pmID)
+	defer v.Release()
+	fn(v)
+}
+
 // Trim shrinks every slice to its length, releasing the spare capacity that
 // append leaves behind (about 100 MB after replaying 10M events). It changes
 // no state, only capacity. It takes each shard's write lock in turn; call it

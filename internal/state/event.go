@@ -1,4 +1,5 @@
-// Package state holds the in-memory rule state and the per-entity apply logic.
+// Package state holds the in-memory rule state, the dispatcher and the reducers
+// that apply stored events to it.
 package state
 
 import "github.com/devastion/anti-fraud-go/internal/money"
@@ -85,6 +86,19 @@ type Event struct {
 	IP              string
 	PaymentMethodID string
 	VoidedEventID   string
+
+	// Log metadata. The reducers never read it. Zero means unset: the store
+	// writes NULL and reads NULL back as zero (rows from before these columns).
+
+	// UUID is a server-assigned UUIDv7, unique in the log.
+	UUID [16]byte
+	// ReceivedAt is when the HTTP handler received the request (unix ms,
+	// X-Test-Now in test mode). CreatedAt is when the writer took the request
+	// off the queue, and ProcessedAt is when its flush began, right before
+	// the insert and the reducers (both unix ms, server clock).
+	ReceivedAt  int64
+	CreatedAt   int64
+	ProcessedAt int64
 }
 
 // HashID is the 64-bit FNV-1a hash used to key bets in Player.RecentBets.

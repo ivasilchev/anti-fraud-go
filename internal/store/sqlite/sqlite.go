@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
 
@@ -33,25 +34,46 @@ CREATE TABLE IF NOT EXISTS events (
   device_id         TEXT,
   ip                TEXT,
   payment_method_id TEXT,
-  voided_event_id   TEXT
+  voided_event_id   TEXT,
+  uuid              BLOB,    -- 16-byte UUIDv7
+  received_at       INTEGER, -- unix ms
+  created_at        INTEGER, -- unix ms
+  processed_at      INTEGER  -- unix ms
 ) STRICT`
+
+// metaColumns were added after the first release. migrate adds them to an
+// older file with ALTER TABLE, so they are nullable everywhere: old rows keep
+// NULL, which StreamEvents reads back as zero.
+var metaColumns = []struct{ name, typ string }{
+	{"uuid", "BLOB"},
+	{"received_at", "INTEGER"},
+	{"created_at", "INTEGER"},
+	{"processed_at", "INTEGER"},
+}
 
 // The indexes are separate from the table so that Import can build them once,
 // after the bulk load, instead of row by row.
 var indexSQL = `
 CREATE UNIQUE INDEX IF NOT EXISTS events_event_id ON events (event_id);
 CREATE UNIQUE INDEX IF NOT EXISTS events_one_void_per_bet ON events (voided_event_id)
-  WHERE type = ` + strconv.Itoa(int(state.EventBetVoided))
+  WHERE type = ` + strconv.Itoa(int(state.EventBetVoided)) + `;
+CREATE UNIQUE INDEX IF NOT EXISTS events_uuid ON events (uuid) WHERE uuid IS NOT NULL`
 
 const columns = `event_id, player_id, type, occurred_at, amount_e4, amount_eur_e4,
-  currency, device_id, ip, payment_method_id, voided_event_id`
+  currency, device_id, ip, payment_method_id, voided_event_id,
+  uuid, received_at, created_at, processed_at`
 
-// insertSQL skips a row that breaks any unique index: a known eventId or a
-// second void of the same bet.
-const insertSQL = `INSERT INTO events (` + columns + `) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+// columnCount is the number of names in columns.
+const columnCount = 15
+
+var placeholders = strings.TrimSuffix(strings.Repeat("?, ", columnCount), ", ")
+
+// insertSQL skips a row that breaks any unique index: a known eventId, a
+// second void of the same bet, or a known uuid.
+var insertSQL = `INSERT INTO events (` + columns + `) VALUES (` + placeholders + `)
 ON CONFLICT DO NOTHING RETURNING seq`
 
-const importSQL = `INSERT INTO events (seq, ` + columns + `) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+var importSQL = `INSERT INTO events (seq, ` + columns + `) VALUES (?, ` + placeholders + `)`
 
 var lookupBetSQL = `SELECT seq, player_id, occurred_at, amount_eur_e4 FROM events
 WHERE event_id = ? AND type = ` + strconv.Itoa(int(state.EventBet))
@@ -105,7 +127,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 }
 
 func (s *Store) init(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, tableSQL+";"+indexSQL); err != nil {
+	if err := s.migrate(ctx); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	var err error
@@ -116,6 +138,43 @@ func (s *Store) init(ctx context.Context) error {
 		return err
 	}
 	s.watermarkAt, err = s.db.PrepareContext(ctx, `SELECT event_id, occurred_at FROM events WHERE seq = ?`)
+	return err
+}
+
+// migrate creates the table, adds the metadata columns to a table from an
+// older release, and creates the indexes. On a file that already has 10M rows,
+// the first run builds events_uuid with one table scan; the old rows have no
+// uuid, so the partial index stays empty for them.
+func (s *Store) migrate(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, tableSQL); err != nil {
+		return err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info('events')`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range metaColumns {
+		if have[c.name] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN `+c.name+` `+c.typ); err != nil {
+			return fmt.Errorf("add column %s: %w", c.name, err)
+		}
+	}
+	_, err = s.db.ExecContext(ctx, indexSQL)
 	return err
 }
 
@@ -162,8 +221,21 @@ func values(ev *state.Event) []any {
 	if ev.Currency != money.NoCurrency {
 		amount, amountEUR, cur = ev.AmountE4, ev.AmountEURE4, ev.Currency.String()
 	}
+	var id any
+	if ev.UUID != ([16]byte{}) {
+		id = ev.UUID[:]
+	}
 	return []any{ev.EventID, ev.PlayerID, int64(ev.Type), ev.OccurredAt, amount, amountEUR, cur,
-		null(ev.DeviceID), null(ev.IP), null(ev.PaymentMethodID), null(ev.VoidedEventID)}
+		null(ev.DeviceID), null(ev.IP), null(ev.PaymentMethodID), null(ev.VoidedEventID),
+		id, nullTime(ev.ReceivedAt), nullTime(ev.CreatedAt), nullTime(ev.ProcessedAt)}
+}
+
+// nullTime maps the unset time 0 to SQL NULL.
+func nullTime(t int64) any {
+	if t == 0 {
+		return nil
+	}
+	return t
 }
 
 // null maps "" to SQL NULL.
@@ -203,12 +275,23 @@ func (s *Store) StreamEvents(ctx context.Context, afterSeq int64, fn func(seq in
 		ev                          state.Event
 		amount, amountEUR           sql.NullInt64
 		cur, dev, ip, method, voids sql.NullString
+		id                          []byte
+		received, created, applied  sql.NullInt64
 	)
 	for rows.Next() {
 		if err := rows.Scan(&seq, &ev.EventID, &ev.PlayerID, &typ, &ev.OccurredAt, &amount, &amountEUR,
-			&cur, &dev, &ip, &method, &voids); err != nil {
+			&cur, &dev, &ip, &method, &voids, &id, &received, &created, &applied); err != nil {
 			return fmt.Errorf("stream events: scan after seq %d: %w", seq, err)
 		}
+		switch len(id) {
+		case 0:
+			ev.UUID = [16]byte{}
+		case 16:
+			ev.UUID = [16]byte(id)
+		default:
+			return fmt.Errorf("stream events: seq %d: uuid has %d bytes, want 16", seq, len(id))
+		}
+		ev.ReceivedAt, ev.CreatedAt, ev.ProcessedAt = received.Int64, created.Int64, applied.Int64
 		ev.Type = state.EventType(typ)
 		ev.AmountE4, ev.AmountEURE4, ev.Currency = 0, 0, money.NoCurrency
 		if cur.Valid {

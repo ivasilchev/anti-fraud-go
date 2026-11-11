@@ -6,12 +6,14 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
-	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/devastion/anti-fraud-go/internal/metrics"
 	"github.com/devastion/anti-fraud-go/internal/state"
@@ -48,12 +50,16 @@ type Log interface {
 type Result struct {
 	Accepted   int
 	Duplicates int
+	// Stored[i] is true when the i-th submitted event was new to the log.
+	// Its UUID is then the one Submit set on the caller's event.
+	Stored []bool
 }
 
 type request struct {
-	events []state.Event
-	now    int64
-	done   chan response
+	events  []state.Event
+	now     int64
+	dequeue int64 // unix ms when Run took the request off the queue
+	done    chan response
 }
 
 type response struct {
@@ -66,15 +72,18 @@ type Config struct {
 	QueueCapacity int
 	FlushEvents   int
 	FlushInterval time.Duration
+	// Now is the clock for created_at and processed_at. Nil means time.Now.
+	Now func() time.Time
 }
 
 // Writer batches submitted events into one store insert per flush. Run must be
 // running for Submit to complete.
 type Writer struct {
-	log     Log
-	st      *state.State
-	metrics *metrics.Metrics
-	cfg     Config
+	log      Log
+	st       *state.State
+	dispatch *state.Dispatcher
+	metrics  *metrics.Metrics
+	cfg      Config
 
 	mu     sync.RWMutex // guards closed and sends on ch
 	closed bool
@@ -107,6 +116,9 @@ func New(log Log, st *state.State, m *metrics.Metrics, cfg Config) *Writer {
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = DefaultFlushInterval
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	if m == nil {
 		m = &metrics.Metrics{}
 	}
@@ -121,6 +133,14 @@ func New(log Log, st *state.State, m *metrics.Metrics, cfg Config) *Writer {
 		ctrl:    make(chan pauseRequest),
 		stopped: make(chan struct{}),
 	}
+	// Late events are counted before voids are resolved, and both before
+	// the reducers run. The writer's bet lookup never fails the dispatch.
+	w.dispatch = state.NewDispatcher(st,
+		state.CountLate(func(n int) { m.LateEvents.Add(int64(n)) }),
+		state.ResolveVoids(func(_ context.Context, ids []string) (map[string]state.BetRef, error) {
+			return w.lookupBets(ids), nil
+		}),
+	)
 	w.lastSnapshotSeq.Store(-1)
 	return w
 }
@@ -129,13 +149,23 @@ func New(log Log, st *state.State, m *metrics.Metrics, cfg Config) *Writer {
 func (w *Writer) QueueDepth() int64 { return w.queued.Load() }
 
 // Submit queues events, received at now (unix ms), and waits until the new
-// ones are persisted and applied. It returns ErrOverloaded without queueing
-// when the queue is full. If ctx ends first, the events are still processed.
+// ones are persisted and applied. It sets each event's UUID (a new UUIDv7)
+// and ReceivedAt (now) before queueing. It returns ErrOverloaded without
+// queueing when the queue is full. If ctx ends first, the events are still
+// processed.
 func (w *Writer) Submit(ctx context.Context, events []state.Event, now int64) (Result, error) {
 	n := int64(len(events))
 	if w.queued.Add(n) > int64(w.cfg.QueueCapacity) {
 		w.queued.Add(-n)
 		return Result{}, ErrOverloaded
+	}
+	for i := range events {
+		id, err := uuid.NewV7()
+		if err != nil {
+			w.queued.Add(-n)
+			return Result{}, fmt.Errorf("ingest: new uuid: %w", err)
+		}
+		events[i].UUID, events[i].ReceivedAt = id, now
 	}
 	req := &request{events: events, now: now, done: make(chan response, 1)}
 	w.mu.RLock()
@@ -182,6 +212,7 @@ func (w *Writer) Run() {
 				return
 			}
 			first = r
+			first.dequeue = w.cfg.Now().UnixMilli()
 		case p := <-w.ctrl:
 			p.done <- w.paused(p.fn)
 			continue
@@ -196,6 +227,7 @@ func (w *Writer) Run() {
 				if !ok {
 					break collect
 				}
+				r.dequeue = w.cfg.Now().UnixMilli()
 				batch = append(batch, r)
 				n += len(r.events)
 			case <-timer.C:
@@ -222,9 +254,13 @@ func (w *Writer) flush(batch []*request, n int) {
 		fail(err)
 		return
 	}
+	processed := w.cfg.Now().UnixMilli()
 	events := make([]state.Event, 0, n)
 	for _, r := range batch {
-		events = append(events, r.events...)
+		for _, ev := range r.events {
+			ev.CreatedAt, ev.ProcessedAt = r.dequeue, processed
+			events = append(events, ev)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	inserted, err := w.log.InsertEvents(ctx, events)
@@ -242,30 +278,36 @@ func (w *Writer) flush(batch []*request, n int) {
 	for _, in := range inserted {
 		seqs[in.EventID] = in.Seq
 	}
-	rows := make([]state.Row, 0, len(inserted))
+	actions := make([]state.Action, 0, len(inserted))
 	results := make([]Result, len(batch))
+	k := 0 // index into events, which follows batch order
 	for bi, r := range batch {
+		results[bi].Stored = make([]bool, len(r.events))
 		for i := range r.events {
-			if seq, ok := seqs[r.events[i].EventID]; ok {
-				delete(seqs, r.events[i].EventID)
-				rows = append(rows, state.Row{Seq: seq, Event: &r.events[i], Now: r.now})
+			ev := &events[k]
+			k++
+			if seq, ok := seqs[ev.EventID]; ok {
+				delete(seqs, ev.EventID)
+				actions = append(actions, state.Action{Seq: seq, Event: ev, Now: r.now})
+				results[bi].Stored[i] = true
 				results[bi].Accepted++
 			} else {
 				results[bi].Duplicates++
 			}
 		}
 	}
-	slices.SortFunc(rows, func(a, b state.Row) int { return cmp.Compare(a.Seq, b.Seq) })
+	slices.SortFunc(actions, func(a, b state.Action) int { return cmp.Compare(a.Seq, b.Seq) })
 
-	refs, missing := w.st.PrepareVoids(rows)
-	if len(missing) > 0 {
-		maps.Copy(refs, w.lookupBets(missing))
+	if err := w.dispatch.Dispatch(context.Background(), &state.Batch{Actions: actions}); err != nil {
+		// Committed but not applied: the next flush catches up from the log.
+		slog.Error("dispatch failed", "events", len(actions), "err", err)
+		w.needCatchUp = true
+		fail(err)
+		return
 	}
-	late := w.st.Apply(rows, refs)
 
-	w.metrics.EventsAccepted.Add(int64(len(rows)))
-	w.metrics.Duplicates.Add(int64(n - len(rows)))
-	w.metrics.LateEvents.Add(int64(late))
+	w.metrics.EventsAccepted.Add(int64(len(actions)))
+	w.metrics.Duplicates.Add(int64(n - len(actions)))
 	w.metrics.ObserveFlush(time.Since(start))
 	for bi, r := range batch {
 		r.done <- response{res: results[bi]}

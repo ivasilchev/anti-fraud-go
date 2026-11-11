@@ -1,12 +1,12 @@
 # Build: Anti-fraud decision service (Go)
 
-You are building a take-home assignment end-to-end. Performance is the top priority after correctness. Work in phases, verify each phase before moving on, and do not stop until every acceptance criterion in section 12 passes. Use Context7 MCP for any library documentation (modernc.org/sqlite, k6, Docker Compose). Ask me only if something is truly blocking; otherwise follow the assumptions in section 11 and record any new ones in AI_NOTES.md.
+You are building a take-home assignment end-to-end. Performance is the top priority after correctness. Work in phases, verify each phase before moving on, and do not stop until every acceptance criterion in section 12 passes. Use Context7 MCP for any library documentation (modernc.org/sqlite, k6). Ask me only if something is truly blocking; otherwise follow the assumptions in section 11 and record any new ones in AI_NOTES.md.
 
 ## 1. Goal
 
 A service that ingests player activity events and answers "is this payment action allowed?" with ALLOW / REVIEW / HOLD plus the reasons.
 
-Hard limits (Docker): the app, with its embedded database, gets 2 CPUs and 2 GB RAM. With 1,000,000 players and 10,000,000 events pre-loaded, over a sustained 10-minute run, all of these must hold:
+Hard limits: the app, with its embedded database, gets 2 CPUs (GOMAXPROCS=2) and 2 GB RAM (peak RSS, checked by make load). With 1,000,000 players and 10,000,000 events pre-loaded, over a sustained 10-minute run, all of these must hold:
 
 - Ingestion of 3,000 events/s with zero events lost.
 - 500 decisions/s at the same time as that ingestion.
@@ -18,11 +18,12 @@ Durability: after a restart, nothing ingested is lost and the same input gets th
 
 ## 2. Tech stack (fixed)
 
-- Language and HTTP: Go 1.25+ (container-aware GOMAXPROCS), stdlib net/http with ServeMux. JSON uses encoding/json; switch to github.com/goccy/go-json only if pprof shows JSON as the hot spot.
-- Database: SQLite, embedded, via modernc.org/sqlite (pure Go, so CGO_ENABLED=0 and a distroless static image still work). WAL mode, synchronous=FULL. One file on the data volume.
+- Language and HTTP: Go 1.25+ (GOMAXPROCS=2 sets the CPU limit), stdlib net/http with ServeMux. JSON uses encoding/json; switch to github.com/goccy/go-json only if pprof shows JSON as the hot spot.
+- Database: SQLite, embedded, via modernc.org/sqlite (pure Go, so CGO_ENABLED=0 builds a static binary). WAL mode, synchronous=FULL. One file in the data directory (data/ by default).
 - Storage abstraction: only internal/store/sqlite and the composition root (cmd/server, cmd/generate) name the engine. Everything else depends on the store.Store interface (section 4).
-- Testing and load: integration tests use a temporary SQLite file per test (no Docker needed), k6 for load.
-- Runtime env: GOMEMLIMIT=1500MiB, GOGC=200 (tune after measuring).
+- Testing and load: integration tests use a temporary SQLite file per test, k6 for load.
+- Runtime: the app runs as a process on the host, started by scripts/app.sh. Docker is optional: a bare-bones Dockerfile and scripts/docker.sh run the same binary in a container with --cpus 2 --memory 2g.
+- Runtime env: GOMAXPROCS=2, GOMEMLIMIT=1500MiB, GOGC=200 (tune after measuring).
 - No Redis or Kafka. The decision path must do zero I/O.
 
 ## 3. Architecture
@@ -38,7 +39,7 @@ Ingestion flow:
    Note: ON CONFLICT DO NOTHING has no conflict target, so it also catches the partial unique index on voids (section 4).
 4. The writer applies only the returned (new) rows to memory, in seq order.
 5. Each waiting request is acknowledged only after its events are applied. This gives read-your-writes.
-6. Response body: {"accepted": n, "duplicates": m}. Rows not returned by the insert count as duplicates.
+6. Response body: {"accepted": n, "duplicates": m, "events": [{"eventId": "...", "uuid": "..."}]}. Rows not returned by the insert count as duplicates. "events" lists only the stored events, in request order. A duplicate gets no uuid in the response.
 
 Decision flow: parse, validate, look up player and device state under shard read-locks, evaluate rules R1–R5 with now = clock.Now(), and return the result. Nothing in this path may allocate beyond the response.
 
@@ -48,7 +49,7 @@ Startup flow:
 2. Replay events WHERE seq > watermark ORDER BY seq, streaming rows (no full result set in memory).
 3. /health/ready returns 503 until replay completes; /health/live always returns 200.
 
-Snapshots: every 5 minutes and on SIGTERM, written to /data/snapshot.bin.tmp and then renamed atomically. The format is binary, carries a version header, and records the seq watermark. Snapshotting goes shard by shard and never blocks decisions for more than about 1 ms. The event log remains the source of truth; the snapshot is only an optimisation.
+Snapshots: every 5 minutes and on SIGTERM, written to data/snapshot.bin.tmp and then renamed atomically. The format is binary, carries a version header, and records the seq watermark. Snapshotting goes shard by shard and never blocks decisions for more than about 1 ms. The event log remains the source of truth; the snapshot is only an optimisation.
 
 Endpoints: POST /events, POST /decisions, GET /health/live, GET /health/ready, GET /metrics (expvar or Prometheus text with counters for duplicates, late events >5 min, rejected requests, flush latency, queue depth). Expose pprof only when PPROF=1.
 
@@ -82,10 +83,24 @@ SQLite schema (internal/store/sqlite, created on startup):
       device_id         TEXT,
       ip                TEXT,
       payment_method_id TEXT,
-      voided_event_id   TEXT
+      voided_event_id   TEXT,
+      uuid              BLOB,     -- 16-byte UUIDv7
+      received_at       INTEGER,  -- unix ms
+      created_at        INTEGER,  -- unix ms
+      processed_at      INTEGER   -- unix ms
     ) STRICT;
     CREATE UNIQUE INDEX events_event_id ON events (event_id);
     CREATE UNIQUE INDEX events_one_void_per_bet ON events (voided_event_id) WHERE type = <BET_VOIDED>;
+    CREATE UNIQUE INDEX events_uuid ON events (uuid) WHERE uuid IS NOT NULL;
+
+Log metadata columns. The reducers never read them.
+
+- uuid: a UUIDv7 that the writer's Submit assigns to each event before it is queued. It is unique in the log. A duplicate's uuid is discarded.
+- received_at: the time the HTTP handler received the request (X-Test-Now in test mode).
+- created_at: the time the writer took the request off the queue (server clock).
+- processed_at: the time the flush began, right before the insert and the reducers (server clock). It is written in the same INSERT, so it does not prove that the reducers ran.
+- The four columns are nullable. Startup adds them with ALTER TABLE ADD COLUMN to a file from before they existed. Old rows keep NULL, which reads back as zero.
+- The generator sets received_at = occurred_at, created_at = processed_at = load start, and a UUIDv7 from occurred_at and the seed.
 
 Add no other indexes. The indexes are separate from the table so that Import builds them once, after the bulk load. Pragmas: journal_mode=WAL, synchronous=FULL, busy_timeout=10000, BEGIN IMMEDIATE for write transactions.
 
@@ -168,6 +183,15 @@ Sharding and concurrency:
 - 256 shards for players and 256 for devices, each guarded by an RWMutex.
 - The writer goroutine is the only mutator; decisions take read-locks only.
 
+State flow (Redux-shaped, updated in place):
+
+- Each stored event is an Action (seq, event, receive time). The writer and replay send a Batch of actions, sorted by seq, through a state.Dispatcher.
+- Middleware runs before the reducers. It can read the state and do I/O, but it never changes the state. CountLate counts late events (writer only). ResolveVoids finds the bets that voids reference, in the batch, in memory, or through store.LookupBets.
+- The root reducer State.Reduce takes the locks, interns IDs and keeps the pending voids. It calls one reducer per entity (reduceDevice, reducePlayer). These reducers do no I/O and take no locks.
+- If a dispatch fails, no action in the batch was reduced.
+- Decisions read through State.Select. The rule functions are the selectors.
+- The type is called Dispatcher, not Store, because store.Store is the event log.
+
 Time is stored as int64 unix milliseconds.
 
 Player state:
@@ -246,7 +270,7 @@ Write the rule engine as pure functions: Evaluate(req, playerView, deviceView, n
 
 ## 9. Data generator (cmd/generate)
 
-Flags: --players=1000000 --events=10000000 --days=90 --seed=42 --db=/data/events.db
+Flags: --players=1000000 --events=10000000 --days=90 --seed=42 --db=data/events.db
 
 Behaviour:
 
@@ -290,18 +314,21 @@ Thresholds:
 - http_req_failed < 0.001
 - the visibility check succeeds 100% of the time and its p(99) is < 1000 ms
 
-Lost-event check: scripts/check-lost.sh compares the unique event IDs accepted, as reported by k6 in handleSummary, with the stored count from `server count-events lt-<runId>-`, run inside the app container. Any difference fails the run.
+Lost-event check: scripts/check-lost.sh compares the unique event IDs accepted, as reported by k6 in handleSummary, with the stored count from `server count-events lt-<runId>-`, run on the host next to the running app. Any difference fails the run.
 
-make load runs the k6 container (compose profile "load", with its own CPU limit), then the lost-event check, then prints a results table.
+make load runs k6 on the host, then the lost-event check, then prints a results table. The run fails if the app process exits or its peak RSS goes over 2 GiB.
 
 Makefile targets:
 
-- make up: docker compose up -d app
+- make up: build the binaries into bin/ and start the app in the background; return when it is ready
+- make down: stop the app (SIGTERM, so it writes a snapshot)
+- make docker-build, make docker-up, make docker-down, make docker-logs: the same app in a container (scripts/docker.sh)
 - make seed: run the generator, then restart the app
 - make verify
 - make test
 - make load
 - make bench
+- make help: list the targets, each with a one-line description from its `## ` comment
 
 ## 11. Assumptions (record them in AI_NOTES.md)
 
@@ -378,19 +405,24 @@ Benchmarks:
     cmd/server, cmd/generate, cmd/verify
     internal/api (handlers, validation, errors)
     internal/ingest (queue, group-commit writer)
-    internal/state (interning, shards, apply, snapshot)
+    internal/state (interning, shards, dispatcher, reducers, snapshot)
     internal/rules (pure engine)
     internal/money
     internal/store (Store interface), internal/store/sqlite (implementation, schema migration on startup), internal/store/storetest (conformance suite)
-    load/k6.js, scripts/, docker-compose.yml, Dockerfile (multi-stage, distroless), Makefile, README.md, AI_NOTES.md
+    load/k6.js, scripts/ (app.sh, docker.sh, load.sh, check-lost.sh), Dockerfile, Makefile, README.md, AI_NOTES.md
 
-docker-compose.yml:
+scripts/app.sh (start, stop, restart, status, pid, rss):
 
-- Service app, with deploy.resources.limits cpus "2" and memory 2g.
-- A named volume "data" for the SQLite file and the snapshot. The generator mounts it too.
-- A healthcheck on the app.
-- Profiles "generate" and "load" for the one-shot containers.
-- docker compose up must start everything with nothing else required.
+- Runs bin/server in the background with GOMAXPROCS=2, GOMEMLIMIT and GOGC set. The pid file and the log go to data/.
+- start refuses a port that is already in use and waits for /health/ready. stop sends SIGTERM.
+- The data directory holds the SQLite file, the snapshot and the manifest. The generator writes to it while the app is stopped.
+- make up must start everything with nothing else required except Go. make load also needs k6.
+
+Dockerfile and scripts/docker.sh (build, up, down, restart, status, logs):
+
+- Two stages: golang builds the three static binaries, and gcr.io/distroless/static-debian12 runs server. No compose file.
+- up runs the container with --cpus 2, --memory 2g and --stop-timeout 60, as the calling user, with data/ mounted at /data. It waits for /health/ready.
+- up refuses to start while the host app runs, because both would write the same SQLite file.
 
 ## 14. Phases (verify each before continuing)
 
@@ -399,6 +431,6 @@ docker-compose.yml:
 3. Startup replay, snapshot, readiness, and the restart durability test.
 4. Generator, manifest and verify. Load 10M events and report load time, replay time and RSS.
 5. k6 load test. Profile with pprof and iterate until every threshold passes with margin. Usual culprits: allocations in JSON decode, lock contention, GC, flush size.
-6. README with run instructions for the service, tests, generator and load test, plus a measured-results table (throughput, p50/p95/p99, error rate, visibility p99, RSS, replay time) and machine specs (CPU model, cores, RAM, OS, Docker version). AI_NOTES.md covering assumptions, trade-offs (single stateful instance; scale-out by partitioning player state by playerId and device state by deviceId behind a log), what you'd do with another day, and where AI tools helped.
+6. README with run instructions for the service, tests, generator and load test, plus a measured-results table (throughput, p50/p95/p99, error rate, visibility p99, RSS, replay time) and machine specs (CPU model, cores, RAM, OS, Go and k6 versions). AI_NOTES.md covering assumptions, trade-offs (single stateful instance; scale-out by partitioning player state by playerId and device state by deviceId behind a log), what you'd do with another day, and where AI tools helped.
 
-Done means: make test, make verify and make load all pass on a fresh clone after docker compose up and make seed.
+Done means: make test, make verify and make load all pass on a fresh clone after make up and make seed.

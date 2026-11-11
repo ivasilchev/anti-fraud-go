@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -112,15 +113,43 @@ func TestSubmitCountsDuplicatesWithinAndAcrossRequests(t *testing.T) {
 	w := startWriter(t, &fakeLog{}, Config{})
 	ctx := context.Background()
 	res, err := w.Submit(ctx, bets("a", "b", "a"), 1)
-	if err != nil || res != (Result{Accepted: 2, Duplicates: 1}) {
+	if err != nil || !reflect.DeepEqual(res, Result{Accepted: 2, Duplicates: 1, Stored: []bool{true, true, false}}) {
 		t.Fatalf("got %+v, %v", res, err)
 	}
 	res, err = w.Submit(ctx, bets("b", "c"), 1)
-	if err != nil || res != (Result{Accepted: 1, Duplicates: 1}) {
+	if err != nil || !reflect.DeepEqual(res, Result{Accepted: 1, Duplicates: 1, Stored: []bool{false, true}}) {
 		t.Fatalf("got %+v, %v", res, err)
 	}
 	if d := w.QueueDepth(); d != 0 {
 		t.Fatalf("queue depth = %d after acknowledgement, want 0", d)
+	}
+}
+
+func TestSubmitSetsLogMetadata(t *testing.T) {
+	log := &fakeLog{}
+	clock := time.UnixMilli(1_700_000_000_500)
+	w := startWriter(t, log, Config{Now: func() time.Time { return clock }})
+	events := bets("a", "b", "a")
+	res, err := w.Submit(context.Background(), events, 1_700_000_000_000)
+	if err != nil || res.Accepted != 2 {
+		t.Fatalf("got %+v, %v", res, err)
+	}
+	if events[0].UUID == events[1].UUID || events[0].UUID == events[2].UUID {
+		t.Fatal("events of one request share a uuid")
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for i, l := range log.logged {
+		ev := l.ev
+		if ev.UUID != events[i].UUID {
+			t.Errorf("logged %s with uuid %x, the caller saw %x", ev.EventID, ev.UUID, events[i].UUID)
+		}
+		if v := ev.UUID[6] >> 4; v != 7 {
+			t.Errorf("%s: uuid version %d, want 7", ev.EventID, v)
+		}
+		if ev.ReceivedAt != 1_700_000_000_000 || ev.CreatedAt != clock.UnixMilli() || ev.ProcessedAt != clock.UnixMilli() {
+			t.Errorf("%s: received %d, created %d, processed %d", ev.EventID, ev.ReceivedAt, ev.CreatedAt, ev.ProcessedAt)
+		}
 	}
 }
 
@@ -193,7 +222,7 @@ func TestFailedFlushThatCommittedIsCaughtUpBeforeTheNextFlush(t *testing.T) {
 	// The client retries a and b and sends c: a and b are duplicates now, but
 	// the catch-up applies them before c.
 	res, err := w.Submit(ctx, bets("a", "b", "c"), 1)
-	if err != nil || res != (Result{Accepted: 1, Duplicates: 2}) {
+	if err != nil || !reflect.DeepEqual(res, Result{Accepted: 1, Duplicates: 2, Stored: []bool{false, false, true}}) {
 		t.Fatalf("got %+v, %v", res, err)
 	}
 	if m := st.Watermark(); m.Seq != 3 || m.EventID != "c" {

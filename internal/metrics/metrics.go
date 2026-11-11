@@ -42,6 +42,10 @@ type Metrics struct {
 	// queueDepth reports the number of events waiting to be flushed. It is
 	// set after recovery, while /metrics is already being served.
 	queueDepth atomic.Pointer[func() int64]
+
+	// HTTP holds the per-route request stats. Nil disables them. It must be
+	// set before the metrics are shared between goroutines.
+	HTTP *HTTP
 }
 
 // SetQueueDepth sets the function that reports the ingest queue depth.
@@ -156,6 +160,10 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 	b = append(b, "# HELP ingest_queue_depth Events waiting to be flushed.\n# TYPE ingest_queue_depth gauge\ningest_queue_depth "...)
 	b = strconv.AppendInt(b, depth, 10)
 	b = append(b, '\n')
+
+	if m.HTTP != nil {
+		b = m.HTTP.appendPrometheus(b)
+	}
 
 	_, err := w.Write(b)
 	return err

@@ -43,7 +43,7 @@ Rules:
 
 Storage (since the switch from Postgres to SQLite):
 
-- The event log is one SQLite file (`/data/events.db`) that the app process
+- The event log is one SQLite file (`data/events.db`) that the app process
   opens itself. Only one process writes to it. `make seed` stops the app
   before the generator replaces the log.
 - SQLite runs in WAL mode with `synchronous=FULL`. An acknowledged event
@@ -51,10 +51,60 @@ Storage (since the switch from Postgres to SQLite):
 - The code outside `internal/store/sqlite` and the two `cmd` entry points
   sees only the `store.Store` interface. A new engine must pass the
   `internal/store/storetest` conformance suite.
+- Each event row has a `uuid` (UUIDv7, 16-byte BLOB, unique) and three times:
+  `received_at` (HTTP handler, `X-Test-Now` in test mode), `created_at`
+  (writer took the request off the queue) and `processed_at` (flush start,
+  right before the insert and the reducers). `processed_at` is written in the
+  same INSERT, so it costs no extra commit but does not prove the reducers ran.
+  In test mode `received_at` can be later than `created_at`.
+- Startup adds these columns to an older file with `ALTER TABLE`, so they are
+  nullable. Rows from before the change have no uuid and no times. The first
+  start on a 10M-row file builds the partial `events_uuid` index with one scan.
+- `POST /events` returns the `eventId` and `uuid` of each stored event, in
+  request order. A duplicate gets no uuid; returning the stored one would
+  need a read per duplicate.
 - Seqs have no gaps for duplicates. Postgres used one seq for each skipped
   row. Nothing depends on gaps or on their absence.
 - The lost-event check counts stored events with `server count-events
-  <prefix>`, inside the app container. The image has no `sqlite3` binary.
+  <prefix>`, on the host, while the app runs. WAL mode lets this second
+  process read the file.
+
+HTTP measurement:
+
+- A middleware records each request by route (the matched ServeMux pattern)
+  and status code. Requests that match no route go to the route `other`.
+  `/metrics` shows `http_requests_total{route,code}` and the histogram
+  `http_request_duration_seconds{route}`. The histogram has bounds at 30 ms
+  and 80 ms, the SPEC's p95 and p99 limits.
+- The latency is measured from the start of the handler to its return. It
+  does not include the time in the kernel socket queues, so it is lower than
+  the latency that k6 measures.
+- Every `HTTP_LOG_INTERVAL` (default `10s`, `0` disables it), the server
+  logs one `http summary` line for each route that served requests in that
+  interval: rate, 2xx/4xx/5xx counts, mean, p50, p95, p99 and max. The
+  percentiles are histogram bucket bounds, capped at the max, so they are
+  upper estimates.
+- `ACCESS_LOG=1` logs one line for each request. It is off by default,
+  because at 3,500 requests/s the log grows by about 1 MB/s.
+- The middleware makes no allocations per request. A test compares the
+  allocations of an instrumented decision with a plain one.
+
+Runtime (since Docker was dropped):
+
+- The app runs as a host process, started by `scripts/app.sh`. Nothing
+  restarts it after a crash. The load test fails if its pid changes.
+- `GOMAXPROCS=2` applies the 2-CPU limit to Go code. Without a cgroup, the OS
+  does not cap memory and cannot OOM-kill the app. `make load` samples the
+  RSS every 5 s with `ps` and fails if the peak goes over 2 GiB. A peak
+  shorter than 5 s can be missed.
+- `process_resident_memory_bytes` in `/metrics` reads `/proc`, so it is
+  missing on macOS. The scripts use `ps` instead.
+- k6 runs on the same host without a CPU limit, so it competes with the app
+  for CPU. The old k6 container was limited to 4 CPUs.
+- A bare-bones `Dockerfile` (no compose file) runs the same binary with
+  `--cpus 2 --memory 2g` through `scripts/docker.sh`. It mounts `data/`, so
+  it shares the event log with the host process. Only one of them may run.
+  `make verify` and `make load` support only the host process.
 
 ## Trade-offs
 
@@ -85,6 +135,18 @@ Storage (since the switch from Postgres to SQLite):
   whole flush.
 - **Snapshot pause.** A snapshot pauses the writer for about 100 ms at 1M
   players. Event acks wait for it; decisions do not.
+- **Redux-shaped state, updated in place.** Each stored event is an action.
+  The writer and replay dispatch batches of actions through a
+  `state.Dispatcher`. It is not called a store, because `store.Store` is the
+  event log.
+  Middleware (`CountLate`, `ResolveVoids`) can read the state and do I/O.
+  Only the reducers (`Reduce`, then `reduceDevice` and `reducePlayer`)
+  change the state, and they do no I/O and take no locks. Decisions read
+  through `State.Select`, and the rule functions act as selectors. Unlike
+  Redux, reducers change entities in place and do not return a new state.
+  Copies for 3,000 events/s over 1M players cost GC time and memory, and no
+  rule needs old versions. `BenchmarkApply` did not change, and each
+  flush makes one more allocation (the batch).
 
 ## With another day
 
