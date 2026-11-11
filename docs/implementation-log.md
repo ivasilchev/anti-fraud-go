@@ -461,3 +461,98 @@ each, k6 at 4 CPUs). TEST_MODE was off; PPROF=1 was on for profiling.
 |---|---|
 | `BenchmarkDecision` (`rules.Evaluate`, busy player and shared device) | 35 ns/op, 0 allocs |
 | `BenchmarkApply` (PrepareVoids + Apply, 2,000-event flush, load-test mix at 3,000/s over 1M players, after a 10-minute warm-up) | 226 ns/event, 18 allocs per flush |
+
+## Redux-shaped state (2026-11-11)
+
+The apply path now has the shape of Redux, with in-place updates:
+
+- `state.Action` (was `state.Row`) is one stored event. `state.Batch` carries
+  the actions of one flush or replay chunk, plus the bets that the voids need.
+- `state.Dispatcher` is a middleware chain that ends in the root reducer
+  `State.Reduce` (was `State.Apply`). It is not called `Store`, because
+  `store.Store` is the event log (SQLite since 873479e). The writer's
+  dispatcher has `CountLate`, then `ResolveVoids`, and its bet lookup never
+  fails. The replay dispatcher has only `ResolveVoids`, and a failed lookup
+  fails the replay. Replay calls `LookupBets` from inside the `StreamEvents`
+  callback, which the `store.Store` contract allows. If a dispatch
+  fails, no action was reduced, and the writer catches up from the log.
+- `Reduce` owns the locks, the interning and the pending voids. It calls
+  `reduceDevice` and `reducePlayer`, which change one entity each and know
+  nothing about locks or other entities.
+- `State.Select` wraps `Acquire` and `Release` for the decision handler. Its
+  closure does not escape, so decisions still make no allocations.
+- `BenchmarkApply` now measures ResolveVoids + Reduce through a dispatcher.
+  Run in turns against aa6f92a in the same container, it shows no change:
+  about 460 ns/event before and 438 after, which is inside the noise. Each
+  flush makes one more allocation (21 instead of 20).
+
+## Docker dropped (2026-11-11)
+
+The app, the generator, verify and k6 now run on the host:
+
+- `Dockerfile`, `docker-compose.yml` and `.dockerignore` are deleted.
+- `scripts/app.sh` starts the server in the background with `GOMAXPROCS=2`,
+  `GOMEMLIMIT=1100MiB` and `GOGC=200`, and writes `data/server.pid` and
+  `data/server.log`. `start` waits for `server healthcheck` and refuses a
+  port that is already in use. Without that check, the health check reached
+  an old app container on 8080 while the new process failed to bind.
+- `make seed` and `make verify` call `bin/generate` and `bin/verify` with
+  files in `data/`. `make manifest` is gone, because the manifest is already
+  on the host.
+- `scripts/load.sh` runs k6 directly. The container restart and OOM checks
+  became two checks: the app keeps the same pid, and the peak RSS (from
+  `ps`) stays at or below 2 GiB.
+- `scripts/check-lost.sh` runs `bin/server count-events` against
+  `data/events.db` while the app runs.
+- The server's default paths are `data/events.db` and `data/snapshot.bin`,
+  relative to the working directory.
+
+Checked with `make up`, `make seed PLAYERS=2000 EVENTS=50000`, `make verify`
+(28/28), `scripts/check-lost.sh` and `make test`. `make load` was not run.
+
+## Bare-bones Docker image (2026-11-11)
+
+Docker came back as an option, without compose:
+
+- `Dockerfile` has two stages: `golang:1.26-alpine` builds the binaries, and
+  `gcr.io/distroless/static-debian12` runs `server`. The image is 64 MB. It
+  sets `DB_PATH=/data/events.db` and `SNAPSHOT_PATH=/data/snapshot.bin` and
+  has a `HEALTHCHECK` that calls `server healthcheck`.
+- `scripts/docker.sh` (`build`, `up`, `down`, `restart`, `status`, `logs`)
+  mirrors `scripts/app.sh`. `up` runs with `--cpus 2 --memory 2g
+  --stop-timeout 60 --user $(id -u):$(id -g)` and mounts `data/` at `/data`.
+  The `--user` flag keeps the files owned by the host user. `up` refuses to
+  start while the host app runs or the port is in use.
+- The Makefile has `docker-build`, `docker-up`, `docker-down` and
+  `docker-logs`. `DATA_DIR` now sets the data directory for the Makefile and
+  the scripts together.
+
+Checked on port 18080: seed on the host, `make docker-up`, a decision
+request, the 2-CPU and 2 GiB limits in `docker inspect`, `make docker-down`
+(snapshot written), then `make up` on the same files.
+
+
+## Event uuid and log timestamps (2026-11-11)
+
+Each event row now has four more columns: `uuid` (16-byte UUIDv7, unique
+through the partial index `events_uuid`), `received_at`, `created_at` and
+`processed_at` (unix ms).
+
+- `Writer.Submit` assigns the uuid (`github.com/google/uuid`, now a direct
+  dependency) and `received_at` before it queues the request. `Run` records
+  `created_at` when it takes a request off the queue. `flush` records
+  `processed_at` once, right before the insert, so there is no second commit.
+- `POST /events` now also returns `"events": [{"eventId", "uuid"}]` for the
+  stored events, in request order. `ingest.Result.Stored` tells the handler
+  which events were stored.
+- `sqlite.Open` adds missing columns with `ALTER TABLE ADD COLUMN`. Old rows
+  keep NULL, and `StreamEvents` reads NULL back as zero. The reducers do not
+  read the new fields.
+- `gen.Load` sets `received_at = occurred_at`, `created_at = processed_at =`
+  load start, and a UUIDv7 built from `occurred_at` and the seed.
+
+New tests: the conformance suite (uuid conflicts, round trip of the new
+fields), migration of an old-schema file, writer metadata with a fake clock,
+the response body, and an integration test that compares the response with
+the stored row. Checked with `go test -race ./...`. `make verify` and
+`make load` were not run.

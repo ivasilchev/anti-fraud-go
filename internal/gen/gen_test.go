@@ -253,15 +253,15 @@ func TestPlantedCasesHoldAgainstTheRuleEngine(t *testing.T) {
 	cfg := smallConfig()
 	events, m := collect(t, cfg)
 	st := state.New()
-	rows := make([]state.Row, len(events))
+	actions := make([]state.Action, len(events))
 	for i := range events {
-		rows[i] = state.Row{Seq: int64(i + 1), Event: &events[i]}
+		actions[i] = state.Action{Seq: int64(i + 1), Event: &events[i]}
 	}
-	refs, missing := st.PrepareVoids(rows)
+	refs, missing := st.PrepareVoids(actions)
 	if len(missing) > 0 {
 		t.Fatalf("voids reference unknown bets: %v", missing)
 	}
-	st.Apply(rows, refs)
+	st.Reduce(&state.Batch{Actions: actions, Bets: refs})
 
 	now := m.GeneratedAt.Add(TestNowOffset).UnixMilli()
 	for _, c := range m.Cases {

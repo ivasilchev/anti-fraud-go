@@ -42,6 +42,10 @@ type Metrics struct {
 	// queueDepth reports the number of events waiting to be flushed. It is
 	// set after recovery, while /metrics is already being served.
 	queueDepth atomic.Pointer[func() int64]
+
+	// HTTP holds the per-route request stats. Nil disables them. It must be
+	// set before the metrics are shared between goroutines.
+	HTTP *HTTP
 }
 
 // SetQueueDepth sets the function that reports the ingest queue depth.
@@ -130,7 +134,7 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 		b = strconv.AppendFloat(b, float64(us)/1e6, 'g', -1, 64)
 		b = append(b, '\n')
 	}
-	gauge("startup_replayed_events", "Events replayed from Postgres at startup.", m.ReplayedEvents.Load())
+	gauge("startup_replayed_events", "Events replayed from the event log at startup.", m.ReplayedEvents.Load())
 	seconds("startup_recovery_seconds", "Time to load the snapshot and replay the tail at startup.", m.ReplayMicros.Load())
 	gauge("startup_snapshot_seq", "Watermark of the snapshot loaded at startup (0: full replay).", m.SnapshotLoadSeq.Load())
 	counter("snapshots_total", "Snapshots written.", m.Snapshots.Load())
@@ -156,6 +160,10 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 	b = append(b, "# HELP ingest_queue_depth Events waiting to be flushed.\n# TYPE ingest_queue_depth gauge\ningest_queue_depth "...)
 	b = strconv.AppendInt(b, depth, 10)
 	b = append(b, '\n')
+
+	if m.HTTP != nil {
+		b = m.HTTP.appendPrometheus(b)
+	}
 
 	_, err := w.Write(b)
 	return err

@@ -219,7 +219,7 @@ func (c *collector) event(re *rawEvent, now time.Time) state.Event {
 
 // id validates an identifier: a non-empty string of at most MaxIDLen
 // characters with no control characters. stringField already guarantees valid
-// UTF-8; Postgres text rejects NUL, and control characters invite log injection.
+// UTF-8; NUL breaks C-string tooling, and control characters invite log injection.
 func (c *collector) id(raw json.RawMessage, field string, required bool) string {
 	s, present, ok := stringField(raw)
 	switch {

@@ -2,152 +2,62 @@ package gen
 
 import (
 	"context"
-	"fmt"
+	"encoding/binary"
+	"math/rand/v2"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/devastion/anti-fraud-go/internal/money"
 	"github.com/devastion/anti-fraud-go/internal/state"
+	"github.com/devastion/anti-fraud-go/internal/store"
 )
-
-var copyColumns = []string{"event_id", "player_id", "type", "occurred_at", "amount_e4", "amount_eur_e4",
-	"currency", "device_id", "ip", "payment_method_id", "voided_event_id"}
-
-const copyBatch = 8192
 
 // LoadStats describes a load.
 type LoadStats struct {
-	Events int64
-	Copy   time.Duration // generation and COPY, which run concurrently
-	Vacuum time.Duration // VACUUM ANALYZE after the load
+	Events   int64
+	Duration time.Duration // generation and import, which run in step
 }
 
-// Load truncates the events table (restarting seq at 1) and streams the
-// generated data set into it with one COPY, in occurredAt order. progress,
-// if not nil, is called after every million events. The schema must exist.
-func Load(ctx context.Context, pool *pgxpool.Pool, cfg Config, progress func(events int64)) (*Manifest, LoadStats, error) {
-	var stats LoadStats
-	if _, err := pool.Exec(ctx, "TRUNCATE events RESTART IDENTITY"); err != nil {
-		return nil, stats, fmt.Errorf("truncate: %w", err)
-	}
+// Load replaces the log in db with the generated data set, in occurredAt
+// order, so seqs start at 1 and follow time. progress, if not nil, is called
+// after every million events.
+//
+// Each event gets log metadata as if it had arrived live: ReceivedAt is its
+// occurredAt, CreatedAt and ProcessedAt are the load start, and its UUIDv7
+// carries occurredAt and random bits from cfg.Seed, so a reseed with the same
+// seed gives the same UUIDs.
+func Load(ctx context.Context, db store.Store, cfg Config, progress func(events int64)) (*Manifest, LoadStats, error) {
 	start := time.Now()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	batches := make(chan []state.Event, 4)
-	free := make(chan []state.Event, 6)
-	for range cap(free) {
-		free <- make([]state.Event, 0, copyBatch)
-	}
-	type genResult struct {
-		m   *Manifest
-		err error
-	}
-	genDone := make(chan genResult, 1)
-	go func() {
-		defer close(batches)
-		buf := <-free
-		send := func() error {
-			select {
-			case batches <- buf:
-			case <-ctx.Done():
-				return ctx.Err()
+	loadedAt := start.UnixMilli()
+	rng := rand.New(rand.NewPCG(cfg.Seed, 0x00dd))
+	var m *Manifest
+	n, err := db.Import(ctx, func(add func(*state.Event) error) error {
+		var count int64
+		var err error
+		m, err = Generate(cfg, func(ev *state.Event) error {
+			ev.UUID = uuidV7(ev.OccurredAt, rng)
+			ev.ReceivedAt, ev.CreatedAt, ev.ProcessedAt = ev.OccurredAt, loadedAt, loadedAt
+			if err := add(ev); err != nil {
+				return err
 			}
-			select {
-			case buf = <-free:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			buf = buf[:0]
-			return nil
-		}
-		m, err := Generate(cfg, func(ev *state.Event) error {
-			buf = append(buf, *ev)
-			if len(buf) == copyBatch {
-				return send()
+			if count++; progress != nil && count%1_000_000 == 0 {
+				progress(count)
 			}
 			return nil
 		})
-		if err == nil && len(buf) > 0 {
-			err = send()
-		}
-		genDone <- genResult{m, err}
-	}()
-
-	src := &copySource{batches: batches, free: free, row: make([]any, len(copyColumns)), progress: progress}
-	n, copyErr := pool.CopyFrom(ctx, pgx.Identifier{"events"}, copyColumns, src)
-	cancel() // unblocks the generator if COPY failed
-	res := <-genDone
-	switch {
-	case res.err != nil && copyErr == nil:
-		return nil, stats, fmt.Errorf("generate: %w", res.err)
-	case copyErr != nil:
-		return nil, stats, fmt.Errorf("copy: %w", copyErr)
+		return err
+	})
+	if err != nil {
+		return nil, LoadStats{}, err
 	}
-	stats.Events, stats.Copy = n, time.Since(start)
-
-	start = time.Now()
-	// Sets hint bits and the visibility map now rather than during the
-	// service's first replay, and gives the planner statistics.
-	if _, err := pool.Exec(context.Background(), "VACUUM (ANALYZE) events"); err != nil {
-		return nil, stats, fmt.Errorf("vacuum: %w", err)
-	}
-	stats.Vacuum = time.Since(start)
-	return res.m, stats, nil
+	return m, LoadStats{Events: n, Duration: time.Since(start)}, nil
 }
 
-// copySource feeds batches of events to CopyFrom, recycling the buffers.
-type copySource struct {
-	batches  <-chan []state.Event
-	free     chan<- []state.Event
-	batch    []state.Event
-	i        int
-	n        int64
-	row      []any
-	progress func(int64)
-}
-
-func (s *copySource) Next() bool {
-	s.i++
-	if s.i >= len(s.batch) {
-		if s.batch != nil {
-			s.free <- s.batch
-		}
-		b, ok := <-s.batches
-		if !ok {
-			s.batch = nil
-			return false
-		}
-		s.batch, s.i = b, 0
-	}
-	s.n++
-	if s.progress != nil && s.n%1_000_000 == 0 {
-		s.progress(s.n)
-	}
-	return true
-}
-
-// Values reuses one row slice: CopyFrom encodes it before calling Next again.
-func (s *copySource) Values() ([]any, error) {
-	ev := &s.batch[s.i]
-	r := s.row
-	r[0], r[1], r[2], r[3] = ev.EventID, ev.PlayerID, int16(ev.Type), time.UnixMilli(ev.OccurredAt)
-	if ev.Currency != money.NoCurrency {
-		r[4], r[5], r[6] = ev.AmountE4, ev.AmountEURE4, ev.Currency.String()
-	} else {
-		r[4], r[5], r[6] = nil, nil, nil
-	}
-	r[7], r[8], r[9], r[10] = null(ev.DeviceID), null(ev.IP), null(ev.PaymentMethodID), null(ev.VoidedEventID)
-	return r, nil
-}
-
-func (s *copySource) Err() error { return nil }
-
-func null(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
+// uuidV7 returns a UUIDv7 (RFC 9562) with the timestamp ms and 74 random bits
+// from rng.
+func uuidV7(ms int64, rng *rand.Rand) [16]byte {
+	var u [16]byte
+	binary.BigEndian.PutUint64(u[0:8], uint64(ms)<<16|rng.Uint64()&0xffff)
+	binary.BigEndian.PutUint64(u[8:16], rng.Uint64())
+	u[6] = 0x70 | u[6]&0x0f // version 7
+	u[8] = 0x80 | u[8]&0x3f // variant 10
+	return u
 }

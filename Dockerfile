@@ -1,23 +1,15 @@
-# syntax=docker/dockerfile:1
-
+# Bare-bones image: the three static binaries on distroless.
+# Build with `make docker-build`, run with `make docker-up` (scripts/docker.sh).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-RUN --mount=type=bind,source=go.mod,target=go.mod \
-    --mount=type=bind,source=go.sum,target=go.sum \
-    --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/bin/ ./cmd/server ./cmd/generate ./cmd/verify \
- && mkdir -p /out/data /out/manifest
+RUN CGO_ENABLED=0 go build -trimpath -o /out/ ./cmd/server ./cmd/generate ./cmd/verify
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build --link /out/bin/ /usr/local/bin/
-# Mount points for the snapshot and manifest volumes, owned by nonroot so that
-# fresh named volumes inherit a writable directory.
-COPY --from=build --link --chown=65532:65532 /out/data /data
-COPY --from=build --link --chown=65532:65532 /out/manifest /manifest
-USER nonroot:nonroot
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/ /usr/local/bin/
+ENV DB_PATH=/data/events.db SNAPSHOT_PATH=/data/snapshot.bin
 EXPOSE 8080
+HEALTHCHECK --start-period=10m --start-interval=1s CMD ["/usr/local/bin/server", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/server"]

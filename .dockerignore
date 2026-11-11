@@ -1,6 +1,6 @@
 .git
 .agents
 .claude
-*.md
-manifest.json
-out/
+bin/
+data/
+load/results/

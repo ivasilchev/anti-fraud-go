@@ -1,4 +1,6 @@
-// Package rules is the pure decision engine. Evaluate does no I/O and does not allocate.
+// Package rules is the pure decision engine. Evaluate does no I/O and does not
+// allocate. Its rule functions are the selectors of the state (see
+// state.Select): they derive a decision from a player and device view.
 package rules
 
 import "github.com/devastion/anti-fraud-go/internal/state"
