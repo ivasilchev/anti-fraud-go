@@ -3,7 +3,7 @@ package state
 
 import "github.com/devastion/anti-fraud-go/internal/money"
 
-// EventType is persisted as smallint in Postgres. Values are stable; never renumber.
+// EventType is persisted as an integer in the event log. Values are stable; never renumber.
 type EventType uint8
 
 const (

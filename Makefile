@@ -1,25 +1,20 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-# testcontainers needs DOCKER_HOST when the socket is not at /var/run/docker.sock
-# (OrbStack, Colima, Docker Desktop on some setups).
-DOCKER_HOST ?= $(shell docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)
-export DOCKER_HOST
-
 .PHONY: up down build seed recovery verify test bench manifest load
 
 build:
 	$(COMPOSE) build app
 
 up: build
-	$(COMPOSE) up -d --wait db app
+	$(COMPOSE) up -d --wait app
 
 down:
 	$(COMPOSE) down
 
-# Generate and load the data set, then restart the app so it replays it.
+# Generate and load the data set, then restart the app so it replays it. The
+# app is stopped first: the generator replaces its event log.
 seed: build
-	$(COMPOSE) up -d --wait db
 	$(COMPOSE) stop app
 	time $(COMPOSE) --profile generate run --rm generate
 	time $(COMPOSE) up -d --wait app

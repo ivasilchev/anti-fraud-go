@@ -68,7 +68,7 @@ type Config struct {
 	FlushInterval time.Duration
 }
 
-// Writer batches submitted events into one INSERT per flush. Run must be
+// Writer batches submitted events into one store insert per flush. Run must be
 // running for Submit to complete.
 type Writer struct {
 	log     Log
@@ -236,7 +236,7 @@ func (w *Writer) flush(batch []*request, n int) {
 		return
 	}
 
-	// Postgres inserts the first occurrence of a duplicated eventId, so the
+	// The store inserts the first occurrence of a duplicated eventId, so the
 	// first occurrence in submission order is the accepted one.
 	seqs := make(map[string]int64, len(inserted))
 	for _, in := range inserted {

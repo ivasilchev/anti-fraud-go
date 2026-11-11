@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/devastion/anti-fraud-go/internal/store/sqlite"
 )
 
 var (
@@ -82,12 +83,12 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// startServer runs the server on dsn and waits until it is ready.
-func startServer(t *testing.T, dsn, snapshotPath string, extraEnv ...string) *proc {
+// startServer runs the server on the database file dbPath and waits until it is ready.
+func startServer(t *testing.T, dbPath, snapshotPath string, extraEnv ...string) *proc {
 	t.Helper()
 	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
 	cmd := exec.Command(buildServer(t))
-	cmd.Env = append(os.Environ(), "DATABASE_URL="+dsn, "ADDR="+addr, "TEST_MODE=true",
+	cmd.Env = append(os.Environ(), "DB_PATH="+dbPath, "ADDR="+addr, "TEST_MODE=true",
 		"SNAPSHOT_PATH="+snapshotPath, "SNAPSHOT_INTERVAL=1h")
 	cmd.Env = append(cmd.Env, extraEnv...)
 	logs := &syncBuffer{}
@@ -95,7 +96,7 @@ func startServer(t *testing.T, dsn, snapshotPath string, extraEnv ...string) *pr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	p := &proc{app: &app{t: t, url: "http://" + addr, dsn: dsn}, cmd: cmd, logs: logs}
+	p := &proc{app: &app{t: t, url: "http://" + addr, dbPath: dbPath}, cmd: cmd, logs: logs}
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
 	t.Cleanup(func() {
@@ -192,30 +193,30 @@ func (p *proc) recovery(wantSnapshotSeq, wantReplayed int64) {
 	}
 }
 
-func queryInt(t *testing.T, dsn, sql string, args ...any) int64 {
+func queryInt(t *testing.T, dbPath, sql string, args ...any) int64 {
 	t.Helper()
-	conn, err := pgx.Connect(context.Background(), dsn)
+	db, err := sqlite.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close(context.Background())
+	defer db.Close()
 	var n int64
-	if err := conn.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+	if err := db.DB().QueryRowContext(context.Background(), sql, args...).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
 }
 
-func maxSeq(t *testing.T, dsn string) int64 {
+func maxSeq(t *testing.T, dbPath string) int64 {
 	t.Helper()
-	return queryInt(t, dsn, "SELECT coalesce(max(seq), 0) FROM events")
+	return queryInt(t, dbPath, "SELECT coalesce(max(seq), 0) FROM events")
 }
 
 // countAfter counts logged events after seq. Seqs have gaps: a skipped
 // duplicate still consumes one.
-func countAfter(t *testing.T, dsn string, seq int64) int64 {
+func countAfter(t *testing.T, dbPath string, seq int64) int64 {
 	t.Helper()
-	return queryInt(t, dsn, "SELECT count(*) FROM events WHERE seq > $1", seq)
+	return queryInt(t, dbPath, "SELECT count(*) FROM events WHERE seq > ?", seq)
 }
 
 func allDecisions(a *app, prefixes ...string) []string {
@@ -228,10 +229,10 @@ func allDecisions(a *app, prefixes ...string) []string {
 }
 
 func TestRestartAfterKillGivesSameDecisions(t *testing.T) {
-	dsn := newDatabase(t)
+	dbPath := newDatabase(t)
 	snap := filepath.Join(t.TempDir(), "snapshot.bin")
 
-	p := startServer(t, dsn, snap)
+	p := startServer(t, dbPath, snap)
 	p.recovery(0, 0)
 	before, after := voidEdgeCases("a-")
 	for _, e := range append(scenario("a-"), before...) {
@@ -239,9 +240,9 @@ func TestRestartAfterKillGivesSameDecisions(t *testing.T) {
 	}
 	// Graceful stop writes a snapshot of everything so far.
 	p.stop()
-	snapSeq := maxSeq(t, dsn)
+	snapSeq := maxSeq(t, dbPath)
 
-	p = startServer(t, dsn, snap)
+	p = startServer(t, dbPath, snap)
 	p.recovery(snapSeq, 0)
 	tail := append(scenario("b-"), after...)
 	p.ingest(t0, tail)
@@ -250,14 +251,14 @@ func TestRestartAfterKillGivesSameDecisions(t *testing.T) {
 		p.ingest(t0, e)
 	}
 	want := allDecisions(p.app, "a-", "b-")
-	tailLen := countAfter(t, dsn, snapSeq)
+	tailLen := countAfter(t, dbPath, snapSeq)
 	if tailLen <= int64(len(tail)) {
 		t.Fatalf("setup: tail of %d events", tailLen)
 	}
 
 	// Killed right after the last acknowledgement: no shutdown, no snapshot.
 	p.kill()
-	p = startServer(t, dsn, snap)
+	p = startServer(t, dbPath, snap)
 	p.recovery(snapSeq, tailLen)
 	if got := allDecisions(p.app, "a-", "b-"); !slices.Equal(got, want) {
 		t.Fatalf("after kill, snapshot + tail:\n got %q\nwant %q", got, want)
@@ -268,17 +269,17 @@ func TestRestartAfterKillGivesSameDecisions(t *testing.T) {
 	if err := os.Remove(snap); err != nil {
 		t.Fatal(err)
 	}
-	p = startServer(t, dsn, snap)
-	p.recovery(0, countAfter(t, dsn, 0))
+	p = startServer(t, dbPath, snap)
+	p.recovery(0, countAfter(t, dbPath, 0))
 	if got := allDecisions(p.app, "a-", "b-"); !slices.Equal(got, want) {
 		t.Fatalf("after kill, full replay:\n got %q\nwant %q", got, want)
 	}
 
 	// Periodic snapshots: one appears within the interval, then a kill.
 	p.kill()
-	p = startServer(t, dsn, snap, "SNAPSHOT_INTERVAL=50ms")
+	p = startServer(t, dbPath, snap, "SNAPSHOT_INTERVAL=50ms")
 	p.ingest(t0, bet("c-bet", "c-p", "1.00", t0))
-	last := maxSeq(t, dsn)
+	last := maxSeq(t, dbPath)
 	deadline := time.Now().Add(10 * time.Second)
 	for p.metric("snapshot_seq") != last {
 		if time.Now().After(deadline) {
@@ -287,7 +288,7 @@ func TestRestartAfterKillGivesSameDecisions(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	p.kill()
-	p = startServer(t, dsn, snap)
+	p = startServer(t, dbPath, snap)
 	p.recovery(last, 0)
 	if got := allDecisions(p.app, "a-", "b-"); !slices.Equal(got, want) {
 		t.Fatalf("after kill, periodic snapshot:\n got %q\nwant %q", got, want)
@@ -295,9 +296,9 @@ func TestRestartAfterKillGivesSameDecisions(t *testing.T) {
 }
 
 func TestKillDuringIngestionLosesNoAcknowledgedEvent(t *testing.T) {
-	dsn := newDatabase(t)
+	dbPath := newDatabase(t)
 	snap := filepath.Join(t.TempDir(), "snapshot.bin")
-	p := startServer(t, dsn, snap, "SNAPSHOT_INTERVAL=30ms")
+	p := startServer(t, dbPath, snap, "SNAPSHOT_INTERVAL=30ms")
 
 	// Each event is an approved deposit for its own player. Once applied, a
 	// withdrawal to that method holds on R2; unapplied, it reviews on R5.
@@ -342,16 +343,16 @@ func TestKillDuringIngestionLosesNoAcknowledgedEvent(t *testing.T) {
 		t.Fatalf("only %d events acknowledged before the kill", len(acked))
 	}
 
-	p = startServer(t, dsn, snap)
+	p = startServer(t, dbPath, snap)
 	t.Logf("acknowledged %d events; restart replayed %d after snapshot seq %d",
 		len(acked), p.metric("startup_replayed_events"), p.metric("startup_snapshot_seq"))
-	var stored int
-	pool := newAppOn(t, dsn).db.Pool()
-	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM events WHERE event_id = ANY($1)", acked).Scan(&stored); err != nil {
+	ids, err := json.Marshal(acked)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if stored != len(acked) {
-		t.Fatalf("%d of %d acknowledged events are in Postgres", stored, len(acked))
+	stored := queryInt(t, dbPath, "SELECT count(*) FROM events WHERE event_id IN (SELECT value FROM json_each(?))", string(ids))
+	if stored != int64(len(acked)) {
+		t.Fatalf("%d of %d acknowledged events are in the log", stored, len(acked))
 	}
 	for _, id := range acked {
 		if got := p.decide(t0, withdrawal(id, "pm-"+id)).String(); got != "HOLD R2_CASHOUT_WITHOUT_PLAY" {

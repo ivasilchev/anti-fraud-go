@@ -6,8 +6,8 @@
 docker compose up
 ```
 
-Or in the background, returning once both services are healthy (`make up`
-does the same):
+Or in the background, returning once the app is healthy (`make up` does the
+same):
 
 ```bash
 docker compose up -d --wait
@@ -19,7 +19,9 @@ The app listens on `http://localhost:8080`
 curl http://localhost:8080/health/ready   # {"status":"ready"}
 ```
 
-The database starts empty. To load 1M players and 10M events, run `make seed`.
+The app stores its event log in an SQLite file, `/data/events.db` on the
+`data` volume, next to its snapshot. There is no separate database service.
+The log starts empty. To load 1M players and 10M events, run `make seed`.
 
 ## Load test results
 
@@ -46,3 +48,10 @@ are each limited to 2 CPUs and 2 GB; k6 runs in its own container (4 CPUs).
 
 Machine: Apple M5, 10 cores, 32 GB RAM, macOS 27.2, OrbStack with Docker
 29.8.2 (VM: 10 CPUs, 16 GB).
+
+These results come from the Postgres version, before the switch to SQLite.
+The first SQLite run (run 1794371451) used Docker Desktop 29.4.3 with a VM of
+10 CPUs and 8 GB. It passed the latency, error, lost-event and visibility
+checks: decision p95 / p99 were 0.99 / 2.21 ms. It failed two checks. k6
+dropped 263 iterations, and the app peaked at 1,237 MiB RSS, over the 1.2 GB
+budget. Seeding took 51 s, and a full replay of 10M events took 18 s.

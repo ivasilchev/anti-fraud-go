@@ -52,7 +52,7 @@ func TestVoidOfBetNoLongerInMemoryIsLookedUp(t *testing.T) {
 	a.ingest(now, bet("b2", "p1", "1.00", now))
 	a.expectDecision(now, withdrawal("p1", "pm1"), "ALLOW")
 
-	// b1 must be found in Postgres; its amount leaves turnover at 1.
+	// b1 must be found in the log; its amount leaves turnover at 1.
 	a.ingest(now, void("v1", "p1", "b1", now))
 	a.expectDecision(now, withdrawal("p1", "pm1"), "HOLD R2_CASHOUT_WITHOUT_PLAY")
 	if n := a.st.Pending.Len(); n != 0 {

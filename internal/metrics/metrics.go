@@ -130,7 +130,7 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 		b = strconv.AppendFloat(b, float64(us)/1e6, 'g', -1, 64)
 		b = append(b, '\n')
 	}
-	gauge("startup_replayed_events", "Events replayed from Postgres at startup.", m.ReplayedEvents.Load())
+	gauge("startup_replayed_events", "Events replayed from the event log at startup.", m.ReplayedEvents.Load())
 	seconds("startup_recovery_seconds", "Time to load the snapshot and replay the tail at startup.", m.ReplayMicros.Load())
 	gauge("startup_snapshot_seq", "Watermark of the snapshot loaded at startup (0: full replay).", m.SnapshotLoadSeq.Load())
 	counter("snapshots_total", "Snapshots written.", m.Snapshots.Load())

@@ -13,7 +13,7 @@ import (
 )
 
 // voidEdgeCases covers every way a void is resolved: from recent bets, from
-// Postgres (bet pruned from memory), pending until the bet arrives, against
+// the log (bet pruned from memory), pending until the bet arrives, against
 // another player's bet, and a second void of the same bet.
 func voidEdgeCases(prefix string) (before, after []ev) {
 	p, q := prefix+"vp", prefix+"vq"
@@ -25,7 +25,7 @@ func voidEdgeCases(prefix string) (before, after []ev) {
 		// 30 minutes late: appended, then pruned by the next bet of p.
 		bet(prefix+"old", p, "5.00", at(30*time.Minute)),
 		bet(prefix+"next", p, "70.00", at(2*time.Minute)),
-		void(prefix+"v-old", p, prefix+"old", at(time.Minute)), // resolved via Postgres
+		void(prefix+"v-old", p, prefix+"old", at(time.Minute)), // resolved via the log
 		void(prefix+"v-early", p, prefix+"later", at(time.Minute)),
 		bet(prefix+"other", q, "9.00", at(time.Minute)),
 		void(prefix+"v-other", p, prefix+"other", at(time.Minute)), // another player's bet: ignored
@@ -145,7 +145,7 @@ func TestSnapshotFromAnotherLogIsIgnored(t *testing.T) {
 
 	reseed := func(events []state.Event) {
 		t.Helper()
-		if _, err := a.db.Pool().Exec(ctx, "TRUNCATE events RESTART IDENTITY"); err != nil {
+		if _, err := a.db.DB().ExecContext(ctx, "DELETE FROM events"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := a.db.InsertEvents(ctx, events); err != nil {
@@ -162,12 +162,12 @@ func TestSnapshotFromAnotherLogIsIgnored(t *testing.T) {
 	}
 	check("reseeded log, same eventIds")
 
-	// The log is reseeded: same seqs, other events (make seed truncates).
+	// The log is reseeded: same seqs, other events (make seed replaces it).
 	reseed(logEvents(t, scenario("z-"), 0))
 	check("reseeded log")
 
 	// The log was truncated and is now shorter than the snapshot.
-	if _, err := a.db.Pool().Exec(ctx, "TRUNCATE events"); err != nil {
+	if _, err := a.db.DB().ExecContext(ctx, "DELETE FROM events"); err != nil {
 		t.Fatal(err)
 	}
 	check("truncated log")

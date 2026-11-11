@@ -98,7 +98,7 @@ type RecoverStats struct {
 // and if it matches the log) and replays the events logged after it. An empty
 // snapshotPath means a full replay. A snapshot that is corrupt, of another
 // version, or taken from a different log (the event at its watermark seq has
-// another eventId or occurredAt) is ignored: Postgres is the source of truth.
+// another eventId or occurredAt) is ignored: the log is the source of truth.
 func Recover(ctx context.Context, log RecoveryLog, snapshotPath string, chunk int) (*state.State, RecoverStats, error) {
 	start := time.Now()
 	var stats RecoverStats

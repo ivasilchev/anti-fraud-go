@@ -1,46 +1,10 @@
 name: anti-fraud-go
 
-# Credentials come from PGUSER/PGPASSWORD (read by pgx), not the URL.
+# The event log is an SQLite file on the data volume, next to the snapshot.
 x-db-env: &db-env
-  DATABASE_URL: postgres://db:5432/antifraud?sslmode=disable
-  PGUSER: ${POSTGRES_USER:-antifraud}
-  PGPASSWORD: ${POSTGRES_PASSWORD:-antifraud}
+  DB_PATH: /data/events.db
 
 services:
-  db:
-    image: postgres:17
-    command:
-      - postgres
-      - -c
-      - shared_buffers=512MB
-      - -c
-      - max_wal_size=4GB
-      - -c
-      - checkpoint_timeout=15min
-      - -c
-      - synchronous_commit=on
-      - -c
-      - wal_compression=on
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-antifraud}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-antifraud}
-      POSTGRES_DB: antifraud
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    shm_size: 256mb
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U antifraud -d antifraud"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
   app:
     build: .
     image: anti-fraud-go:latest
@@ -57,10 +21,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - snapshots:/data
-    depends_on:
-      db:
-        condition: service_healthy
+      - data:/data
     restart: unless-stopped
     stop_grace_period: 60s
     healthcheck:
@@ -89,10 +50,8 @@ services:
       - --manifest=/manifest/manifest.json
     environment: *db-env
     volumes:
+      - data:/data
       - manifest:/manifest
-    depends_on:
-      db:
-        condition: service_healthy
 
   verify:
     image: anti-fraud-go:latest
@@ -121,6 +80,5 @@ services:
           memory: 2g
 
 volumes:
-  pgdata:
-  snapshots:
+  data:
   manifest:

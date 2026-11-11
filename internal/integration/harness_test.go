@@ -1,100 +1,39 @@
-// Package integration runs the real HTTP server, writer and Postgres store
-// against a testcontainers Postgres.
+// Package integration runs the real HTTP server, writer and event store,
+// each test on its own SQLite file.
 package integration
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"os"
-	"sync/atomic"
+	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/devastion/anti-fraud-go/internal/api"
 	"github.com/devastion/anti-fraud-go/internal/ingest"
 	"github.com/devastion/anti-fraud-go/internal/metrics"
 	"github.com/devastion/anti-fraud-go/internal/state"
-	"github.com/devastion/anti-fraud-go/internal/store"
+	"github.com/devastion/anti-fraud-go/internal/store/sqlite"
 )
 
-// adminDSN connects to the container's default database; each test creates its own.
-var adminDSN string
-
-func TestMain(m *testing.M) {
-	os.Exit(runMain(m))
-}
-
-func runMain(m *testing.M) int {
-	flag.Parse()
-	if testing.Short() {
-		return 0
-	}
-	ctx := context.Background()
-	ctr, err := postgres.Run(ctx, "postgres:17-alpine",
-		postgres.WithDatabase("antifraud"),
-		postgres.WithUsername("antifraud"),
-		postgres.WithPassword("antifraud"),
-		postgres.BasicWaitStrategies(),
-	)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "start postgres:", err)
-		return 1
-	}
-	defer func() {
-		if err := testcontainers.TerminateContainer(ctr); err != nil {
-			fmt.Fprintln(os.Stderr, "terminate postgres:", err)
-		}
-	}()
-	adminDSN, err = ctr.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "connection string:", err)
-		return 1
-	}
-	return m.Run()
-}
-
-var dbCounter atomic.Int64
-
-// newDatabase creates an empty database and returns its DSN.
+// newDatabase returns the path of a new, empty database file.
 func newDatabase(t *testing.T) string {
 	t.Helper()
-	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, adminDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close(ctx)
-	name := fmt.Sprintf("t%d_%d", os.Getpid(), dbCounter.Add(1))
-	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name); err != nil {
-		t.Fatal(err)
-	}
-	u, err := url.Parse(adminDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.Path = "/" + name
-	return u.String()
+	return filepath.Join(t.TempDir(), "events.db")
 }
 
 // app is one service instance: store, state, writer and HTTP server. For a
 // server running as a separate process (see restart_test.go), only t, url and
-// dsn are set.
+// dbPath are set.
 type app struct {
 	t       *testing.T
 	url     string
-	dsn     string
-	db      *store.Store
+	dbPath  string
+	db      *sqlite.Store
 	st      *state.State
 	w       *ingest.Writer
 	metrics *metrics.Metrics
@@ -107,10 +46,10 @@ func newApp(t *testing.T) *app {
 	return newAppOn(t, newDatabase(t))
 }
 
-// newAppOn starts an in-process service with empty state on the database dsn.
-func newAppOn(t *testing.T, dsn string) *app {
+// newAppOn starts an in-process service with empty state on the database file dbPath.
+func newAppOn(t *testing.T, dbPath string) *app {
 	t.Helper()
-	db, err := store.Open(context.Background(), dsn)
+	db, err := sqlite.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +71,7 @@ func newAppOn(t *testing.T, dsn string) *app {
 		<-done
 		db.Close()
 	})
-	return &app{t: t, url: hs.URL, dsn: dsn, db: db, st: st, w: w, metrics: m}
+	return &app{t: t, url: hs.URL, dbPath: dbPath, db: db, st: st, w: w, metrics: m}
 }
 
 // post sends body as JSON with X-Test-Now = now and decodes the JSON response.
@@ -220,7 +159,7 @@ func (a *app) countEvents(where string, args ...any) int {
 	if where != "" {
 		q += " WHERE " + where
 	}
-	if err := a.db.Pool().QueryRow(context.Background(), q, args...).Scan(&n); err != nil {
+	if err := a.db.DB().QueryRowContext(context.Background(), q, args...).Scan(&n); err != nil {
 		a.t.Fatal(err)
 	}
 	return n

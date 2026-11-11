@@ -41,6 +41,21 @@ Rules:
 - R5 fires when the method was never used in an approved deposit, including
   for an unknown player.
 
+Storage (since the switch from Postgres to SQLite):
+
+- The event log is one SQLite file (`/data/events.db`) that the app process
+  opens itself. Only one process writes to it. `make seed` stops the app
+  before the generator replaces the log.
+- SQLite runs in WAL mode with `synchronous=FULL`. An acknowledged event
+  survives a crash of the process and a power loss.
+- The code outside `internal/store/sqlite` and the two `cmd` entry points
+  sees only the `store.Store` interface. A new engine must pass the
+  `internal/store/storetest` conformance suite.
+- Seqs have no gaps for duplicates. Postgres used one seq for each skipped
+  row. Nothing depends on gaps or on their absence.
+- The lost-event check counts stored events with `server count-events
+  <prefix>`, inside the app container. The image has no `sqlite3` binary.
+
 ## Trade-offs
 
 - **One stateful instance.** All rule state is in memory in one process
@@ -51,11 +66,14 @@ Rules:
   and device state by `deviceId` behind a log. Each partition consumes its
   slice of the log. A decision that needs both a player view and a device
   view (R1, R4) then makes one extra hop.
-- **Postgres is the log, not a query store.** An event is acknowledged only
-  after it is committed and applied to memory. Group commit (one `INSERT …
-  unnest` per flush of up to 2,000 events or 5 ms) keeps that durable at
-  3,000 events/s with a 2–3 ms flush. Restarts rebuild memory from a snapshot
-  plus the log tail: 0.4 s, or 7 s for a full replay of 10M events.
+- **An embedded SQLite file is the log, not a query store.** An event is
+  acknowledged only after it is committed and applied to memory. Group commit
+  (one transaction per flush of up to 2,000 events or 5 ms) keeps that durable
+  at 3,000 events/s. The mean flush took 1.8 ms. Restarts rebuild memory from
+  a snapshot plus the log tail in 0.4 s. A full replay of 10M events takes
+  18 s (7 s with Postgres). The cost: SQLite has one writer, and only the app
+  process can open the file. A shared log for scale-out needs another
+  `store.Store` implementation.
 - **Pruning follows the log clock, not the wall clock.** Live state, a full
   replay and snapshot + tail are byte-identical, and the tests check this.
   The cost is a little extra memory when traffic stops.

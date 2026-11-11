@@ -679,7 +679,7 @@ func TestParseEventsRejectsControlCharactersInIDs(t *testing.T) {
 	}
 }
 
-func TestParseEventsRejectsIDsPostgresCannotStore(t *testing.T) {
+func TestParseEventsRejectsNULAndInvalidUTF8(t *testing.T) {
 	for name, body := range map[string]string{
 		"NUL escape":        `{"eventId":"a\u0000b","playerId":"p1","occurredAt":"2025-06-01T11:59:00Z","type":"PASSWORD_RESET"}`,
 		"invalid UTF-8":     "{\"eventId\":\"a\xffb\",\"playerId\":\"p1\",\"occurredAt\":\"2025-06-01T11:59:00Z\",\"type\":\"PASSWORD_RESET\"}",
@@ -689,7 +689,7 @@ func TestParseEventsRejectsIDsPostgresCannotStore(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			evs, err := ParseEvents([]byte(body), now)
 			if err == nil {
-				t.Fatalf("accepted %+q", evs[0])
+				t.Fatalf("accepted %+v", evs[0])
 			}
 			if err.Code != CodeValidationFailed || len(err.Details) != 1 || err.Details[0].Code != CodeInvalidField {
 				t.Fatalf("got %s %v, want one INVALID_FIELD", err.Code, detailStrings(err.Details))

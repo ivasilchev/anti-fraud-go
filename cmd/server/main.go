@@ -22,16 +22,23 @@ import (
 	"github.com/devastion/anti-fraud-go/internal/metrics"
 	"github.com/devastion/anti-fraud-go/internal/state"
 	"github.com/devastion/anti-fraud-go/internal/store"
+	"github.com/devastion/anti-fraud-go/internal/store/sqlite"
 )
 
 const (
+	defaultDBPath           = "/data/events.db"
 	defaultSnapshotPath     = "/data/snapshot.bin"
 	defaultSnapshotInterval = 5 * time.Minute
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(healthcheck())
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "healthcheck":
+			os.Exit(healthcheck())
+		case "count-events":
+			os.Exit(countEvents(os.Args[2:]))
+		}
 	}
 	if err := run(); err != nil {
 		slog.Error("server failed", "err", err)
@@ -40,7 +47,7 @@ func main() {
 }
 
 type config struct {
-	dsn, addr        string
+	dbPath, addr     string
 	snapshotPath     string // "" disables snapshots
 	snapshotInterval time.Duration
 	testMode, pprof  bool
@@ -48,15 +55,15 @@ type config struct {
 
 func loadConfig() (config, error) {
 	c := config{
-		dsn:              os.Getenv("DATABASE_URL"),
+		dbPath:           os.Getenv("DB_PATH"),
 		addr:             os.Getenv("ADDR"),
 		snapshotPath:     defaultSnapshotPath,
 		snapshotInterval: defaultSnapshotInterval,
 		testMode:         os.Getenv("TEST_MODE") == "true",
 		pprof:            os.Getenv("PPROF") == "1",
 	}
-	if c.dsn == "" {
-		return c, errors.New("DATABASE_URL is required")
+	if c.dbPath == "" {
+		c.dbPath = defaultDBPath
 	}
 	if c.addr == "" {
 		c.addr = ":8080"
@@ -88,7 +95,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, cfg.dsn)
+	db, err := openStore(ctx, cfg.dbPath)
 	if err != nil {
 		return err
 	}
@@ -230,6 +237,44 @@ func takeSnapshot(w *ingest.Writer, m *metrics.Metrics, path string) {
 		m.SnapshotPauseMicros.Store(info.Pause.Microseconds())
 		slog.Info("snapshot written", "seq", info.Seq, "bytes", info.Bytes, "pause", info.Pause, "elapsed", info.Elapsed)
 	}
+}
+
+// openStore opens the event log. It is the only place that names the
+// storage engine.
+func openStore(ctx context.Context, path string) (store.Store, error) {
+	s, err := sqlite.Open(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// countEvents prints how many logged events have an eventId starting with
+// args[0] (all events without an argument). The load test uses it to check
+// for lost events; it is safe to run next to the server.
+func countEvents(args []string) int {
+	prefix := ""
+	if len(args) > 0 {
+		prefix = args[0]
+	}
+	path := os.Getenv("DB_PATH")
+	if path == "" {
+		path = defaultDBPath
+	}
+	ctx := context.Background()
+	db, err := openStore(ctx, path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer db.Close()
+	n, err := db.CountEvents(ctx, prefix)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(n)
+	return 0
 }
 
 // healthcheck is the container healthcheck (distroless has no curl): it

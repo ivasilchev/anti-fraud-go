@@ -15,7 +15,7 @@ import (
 	"github.com/devastion/anti-fraud-go/internal/store"
 )
 
-// fakeLog mimics the INSERT ... ON CONFLICT DO NOTHING semantics in memory.
+// fakeLog mimics the store's de-duplicating insert in memory.
 // If block is set, InsertEvents waits until it is closed. If err is set,
 // InsertEvents fails, after committing the events if commitOnErr is set.
 type fakeLog struct {

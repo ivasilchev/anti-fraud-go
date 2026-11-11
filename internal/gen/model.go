@@ -1,5 +1,5 @@
 // Package gen generates the synthetic data set (background activity plus
-// planted rule scenarios), loads it into Postgres and verifies the planted
+// planted rule scenarios), loads it into the event log and verifies the planted
 // scenarios against a running service.
 package gen
 

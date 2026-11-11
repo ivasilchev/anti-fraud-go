@@ -1,12 +1,12 @@
 # Build: Anti-fraud decision service (Go)
 
-You are building a take-home assignment end-to-end. Performance is the top priority after correctness. Work in phases, verify each phase before moving on, and do not stop until every acceptance criterion in section 12 passes. Use Context7 MCP for any library documentation (pgx v5, k6, testcontainers-go, Docker Compose). Ask me only if something is truly blocking; otherwise follow the assumptions in section 11 and record any new ones in AI_NOTES.md.
+You are building a take-home assignment end-to-end. Performance is the top priority after correctness. Work in phases, verify each phase before moving on, and do not stop until every acceptance criterion in section 12 passes. Use Context7 MCP for any library documentation (modernc.org/sqlite, k6, Docker Compose). Ask me only if something is truly blocking; otherwise follow the assumptions in section 11 and record any new ones in AI_NOTES.md.
 
 ## 1. Goal
 
 A service that ingests player activity events and answers "is this payment action allowed?" with ALLOW / REVIEW / HOLD plus the reasons.
 
-Hard limits (Docker): the app gets 2 CPUs and 2 GB RAM; Postgres gets 2 CPUs and 2 GB RAM. With 1,000,000 players and 10,000,000 events pre-loaded, over a sustained 10-minute run, all of these must hold:
+Hard limits (Docker): the app, with its embedded database, gets 2 CPUs and 2 GB RAM. With 1,000,000 players and 10,000,000 events pre-loaded, over a sustained 10-minute run, all of these must hold:
 
 - Ingestion of 3,000 events/s with zero events lost.
 - 500 decisions/s at the same time as that ingestion.
@@ -19,21 +19,22 @@ Durability: after a restart, nothing ingested is lost and the same input gets th
 ## 2. Tech stack (fixed)
 
 - Language and HTTP: Go 1.25+ (container-aware GOMAXPROCS), stdlib net/http with ServeMux. JSON uses encoding/json; switch to github.com/goccy/go-json only if pprof shows JSON as the hot spot.
-- Database: PostgreSQL 17 via github.com/jackc/pgx/v5 (pgxpool). Pass Go slices as array parameters for unnest-based bulk inserts. Use CopyFrom in the generator.
-- Testing and load: testcontainers-go for integration tests, k6 for load.
+- Database: SQLite, embedded, via modernc.org/sqlite (pure Go, so CGO_ENABLED=0 and a distroless static image still work). WAL mode, synchronous=FULL. One file on the data volume.
+- Storage abstraction: only internal/store/sqlite and the composition root (cmd/server, cmd/generate) name the engine. Everything else depends on the store.Store interface (section 4).
+- Testing and load: integration tests use a temporary SQLite file per test (no Docker needed), k6 for load.
 - Runtime env: GOMEMLIMIT=1500MiB, GOGC=200 (tune after measuring).
 - No Redis or Kafka. The decision path must do zero I/O.
 
 ## 3. Architecture
 
-A single stateful Go process. Postgres is the durable log and the de-duplication authority. All rule state lives in memory.
+A single stateful Go process. The event store (store.Store, backed by SQLite) is the durable log and the de-duplication authority. All rule state lives in memory.
 
 Ingestion flow:
 
 1. Handler parses and validates the whole request. Any invalid event rejects the entire request with 400 (all-or-nothing).
 2. Valid events go onto a bounded channel (capacity 50,000 events). If the channel is full, return 503 OVERLOADED. Size it so this never happens under the target load.
-3. A single writer goroutine flushes every 5 ms or every 2,000 events, whichever comes first. One statement per flush:
-   INSERT INTO events (...) SELECT * FROM unnest($1::text[], $2::text[], $3::smallint[], $4::timestamptz[], ...) ON CONFLICT DO NOTHING RETURNING seq, event_id
+3. A single writer goroutine flushes every 5 ms or every 2,000 events, whichever comes first. One transaction per flush (store.InsertEvents), with one prepared statement per row:
+   INSERT INTO events (...) VALUES (?, ...) ON CONFLICT DO NOTHING RETURNING seq
    Note: ON CONFLICT DO NOTHING has no conflict target, so it also catches the partial unique index on voids (section 4).
 4. The writer applies only the returned (new) rows to memory, in seq order.
 5. Each waiting request is acknowledged only after its events are applied. This gives read-your-writes.
@@ -47,29 +48,46 @@ Startup flow:
 2. Replay events WHERE seq > watermark ORDER BY seq, streaming rows (no full result set in memory).
 3. /health/ready returns 503 until replay completes; /health/live always returns 200.
 
-Snapshots: every 5 minutes and on SIGTERM, written to /data/snapshot.bin.tmp and then renamed atomically. The format is binary, carries a version header, and records the seq watermark. Snapshotting goes shard by shard and never blocks decisions for more than about 1 ms. Postgres remains the source of truth; the snapshot is only an optimisation.
+Snapshots: every 5 minutes and on SIGTERM, written to /data/snapshot.bin.tmp and then renamed atomically. The format is binary, carries a version header, and records the seq watermark. Snapshotting goes shard by shard and never blocks decisions for more than about 1 ms. The event log remains the source of truth; the snapshot is only an optimisation.
 
 Endpoints: POST /events, POST /decisions, GET /health/live, GET /health/ready, GET /metrics (expvar or Prometheus text with counters for duplicates, late events >5 min, rejected requests, flush latency, queue depth). Expose pprof only when PPROF=1.
 
-## 4. Postgres schema
+## 4. Event store
+
+Interface (internal/store). The rest of the code sees only this:
+
+    type Store interface {
+      InsertEvents(ctx, events) ([]Inserted, error)  // atomic, durable, skips duplicates; first occurrence in a call wins
+      LookupBets(ctx, ids) (map[eventId]BetRef, error)
+      StreamEvents(ctx, afterSeq, fn) error          // seq order, streamed, fn may call LookupBets
+      WatermarkAt(ctx, seq) (Watermark, ok, error)
+      Import(ctx, fill) (n, error)                   // replaces the log, seq from 1 (generator)
+      CountEvents(ctx, idPrefix) (n, error)          // lost-event check
+      Close() error
+    }
+
+internal/store/storetest is a conformance suite. Every implementation must pass it.
+
+SQLite schema (internal/store/sqlite, created on startup):
 
     CREATE TABLE events (
-      seq               bigserial PRIMARY KEY,
-      event_id          text NOT NULL UNIQUE,
-      player_id         text NOT NULL,
-      type              smallint NOT NULL,
-      occurred_at       timestamptz NOT NULL,
-      amount_e4         bigint,
-      amount_eur_e4     bigint,
-      currency          char(3),
-      device_id         text,
-      ip                text,
-      payment_method_id text,
-      voided_event_id   text
-    );
+      seq               INTEGER PRIMARY KEY,
+      event_id          TEXT NOT NULL,
+      player_id         TEXT NOT NULL,
+      type              INTEGER NOT NULL,
+      occurred_at       INTEGER NOT NULL,  -- unix ms
+      amount_e4         INTEGER,
+      amount_eur_e4     INTEGER,
+      currency          TEXT,
+      device_id         TEXT,
+      ip                TEXT,
+      payment_method_id TEXT,
+      voided_event_id   TEXT
+    ) STRICT;
+    CREATE UNIQUE INDEX events_event_id ON events (event_id);
     CREATE UNIQUE INDEX events_one_void_per_bet ON events (voided_event_id) WHERE type = <BET_VOIDED>;
 
-Add no other indexes. Settings: shared_buffers=512MB, max_wal_size=4GB, checkpoint_timeout=15min, synchronous_commit=on, wal_compression=on. Pass these as command flags in docker-compose.
+Add no other indexes. The indexes are separate from the table so that Import builds them once, after the bulk load. Pragmas: journal_mode=WAL, synchronous=FULL, busy_timeout=10000, BEGIN IMMEDIATE for write transactions.
 
 ## 5. API contracts
 
@@ -187,7 +205,7 @@ Rules for applying an event (all of these must be order-independent within 5 min
   - If its eventId is in pendingVoids, delete it from pendingVoids and treat the bet as voided: store it in recentBets with voided = true and do not count it.
   - Otherwise, if t ≥ lastDepositT, turnoverEUR += amount. Append it to recentBets either way.
 - BET_VOIDED:
-  - Find the bet in recentBets first. If it is not there, look it up in Postgres by event_id, batching all voids of a flush into one query: WHERE event_id = ANY($1) AND type = BET.
+  - Find the bet in recentBets first. If it is not there, look it up in the event store by event_id, batching all voids of a flush into one LookupBets call (BET events only).
   - If the bet is found, belongs to this player, and t_b ≥ lastDepositT, subtract its amount and mark it voided.
   - If it is not found, add it to pendingVoids.
   - A second void of the same bet never reaches this point, because the partial unique index makes the insert a no-op.
@@ -228,11 +246,11 @@ Write the rule engine as pure functions: Evaluate(req, playerView, deviceView, n
 
 ## 9. Data generator (cmd/generate)
 
-Flags: --players=1000000 --events=10000000 --days=90 --seed=42 --dsn=...
+Flags: --players=1000000 --events=10000000 --days=90 --seed=42 --db=/data/events.db
 
 Behaviour:
 
-- Truncates the events table, then loads via pgx CopyFrom with rows sorted by occurredAt, so seq order roughly follows time order.
+- Replaces the log through store.Import with rows sorted by occurredAt, so seq order follows time order. The app must be stopped meanwhile.
 - Must finish in a few minutes.
 - Deterministic IDs: players p0000001…, devices d…, payment methods pm…, events g-<n>.
 
@@ -272,13 +290,13 @@ Thresholds:
 - http_req_failed < 0.001
 - the visibility check succeeds 100% of the time and its p(99) is < 1000 ms
 
-Lost-event check: scripts/check-lost.sh compares the unique event IDs accepted, as reported by k6 in handleSummary, with SELECT count(*) FROM events WHERE event_id LIKE 'lt-<runId>-%'. Any difference fails the run.
+Lost-event check: scripts/check-lost.sh compares the unique event IDs accepted, as reported by k6 in handleSummary, with the stored count from `server count-events lt-<runId>-`, run inside the app container. Any difference fails the run.
 
 make load runs the k6 container (compose profile "load", with its own CPU limit), then the lost-event check, then prints a results table.
 
 Makefile targets:
 
-- make up: docker compose up -d app + db
+- make up: docker compose up -d app
 - make seed: run the generator, then restart the app
 - make verify
 - make test
@@ -342,7 +360,7 @@ Combinations:
 
 Validation: every error code has a test.
 
-Integration tests (testcontainers Postgres plus the real HTTP server):
+Integration tests (a temporary SQLite file plus the real HTTP server):
 
 - Duplicate in the same batch and across batches.
 - Concurrent duplicate submissions.
@@ -363,21 +381,21 @@ Benchmarks:
     internal/state (interning, shards, apply, snapshot)
     internal/rules (pure engine)
     internal/money
-    internal/store (pgx, schema migration on startup)
+    internal/store (Store interface), internal/store/sqlite (implementation, schema migration on startup), internal/store/storetest (conformance suite)
     load/k6.js, scripts/, docker-compose.yml, Dockerfile (multi-stage, distroless), Makefile, README.md, AI_NOTES.md
 
 docker-compose.yml:
 
-- Services app and db, each with deploy.resources.limits cpus "2" and memory 2g.
-- Named volumes for pgdata and app snapshots.
-- Healthchecks; app depends_on db being healthy.
+- Service app, with deploy.resources.limits cpus "2" and memory 2g.
+- A named volume "data" for the SQLite file and the snapshot. The generator mounts it too.
+- A healthcheck on the app.
 - Profiles "generate" and "load" for the one-shot containers.
 - docker compose up must start everything with nothing else required.
 
 ## 14. Phases (verify each before continuing)
 
 1. Money, validation and the rule engine with unit tests (all green).
-2. Postgres store, group-commit writer, apply, and HTTP endpoints, with integration tests for duplicates, late events and voids.
+2. Event store, group-commit writer, apply, and HTTP endpoints, with integration tests for duplicates, late events and voids.
 3. Startup replay, snapshot, readiness, and the restart durability test.
 4. Generator, manifest and verify. Load 10M events and report load time, replay time and RSS.
 5. k6 load test. Profile with pprof and iterate until every threshold passes with margin. Usual culprits: allocations in JSON decode, lock contention, GC, flush size.
